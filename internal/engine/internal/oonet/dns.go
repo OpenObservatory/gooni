@@ -187,10 +187,10 @@ func (c *dnsMiekgCodec) DecodeLookupHostResponse(
 		return nil, ErrDNSNoSuchHost
 	case dns.RcodeServerFailure:
 		return nil, ErrDNSServerTemporarilyMisbehaving
-	default:
-		return nil, ErrDNSServerMisbehaving
 	case dns.RcodeSuccess:
 		// fallthrough
+	default:
+		return nil, ErrDNSServerMisbehaving
 	}
 	var addrs []string
 	for _, answer := range reply.Answer {

@@ -200,7 +200,7 @@ func (c *QUICHandshaker) DialEarlyContext(ctx context.Context, address string,
 		&net.UDPAddr{IP: ip, Port: port},
 		"", // quic-go code will use tlsConf.ServerName
 		tlsConf, quicConf)
-	elapsed := time.Now().Sub(start)
+	elapsed := time.Since(start)
 	if err != nil {
 		err = &ErrQUICHandshake{err}
 		ContextMonitor(ctx).OnQUICHandshakeDone(

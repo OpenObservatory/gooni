@@ -109,7 +109,7 @@ func (c *TCPConnector) DialContext(
 	dialer := c.newDialer(c.connectTimeout())
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, network, address)
-	elapsed := time.Now().Sub(start)
+	elapsed := time.Since(start)
 	if err != nil {
 		err = &ErrConnect{err}
 		ContextMonitor(ctx).OnTCPConnect(address, nil, elapsed, err)
