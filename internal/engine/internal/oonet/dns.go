@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -73,14 +78,14 @@ func (r *DNSResolver) LookupHost(ctx context.Context, hostname string) ([]string
 	return addrs, err
 }
 
-// DNSIdleConnectionsCloser allows to close idle connections.
-type DNSIdleConnectionsCloser interface {
+// dnsIdleConnectionsCloser allows to close idle connections.
+type dnsIdleConnectionsCloser interface {
 	CloseIdleConnections()
 }
 
 // CloseIdleConnections closes idle connections.
-func (r *DNSResolver) CloseIdleConnection() {
-	if c, ok := r.underlyingResolver().(DNSIdleConnectionsCloser); ok {
+func (r *DNSResolver) CloseIdleConnections() {
+	if c, ok := r.underlyingResolver().(dnsIdleConnectionsCloser); ok {
 		c.CloseIdleConnections()
 	}
 }
@@ -313,7 +318,7 @@ func (r *DNSOverHTTPSResolver) CloseIdleConnection() {
 	// We only close the idle connections if we own the Client, otherwise we
 	// don't want to aggressively kill connections.
 	if r.OwnsClient {
-		if c, ok := r.client().(DNSIdleConnectionsCloser); ok {
+		if c, ok := r.client().(dnsIdleConnectionsCloser); ok {
 			c.CloseIdleConnections()
 		}
 	}
@@ -384,4 +389,283 @@ func (r *dnsGenericResolver) doLookupHost(
 		return nil, err
 	}
 	return r.codec.DecodeLookupHostResponse(ctx, qtype, reply)
+}
+
+// DNSOverTLSDialer is the Dialer used by DNSOverTLSResolver.
+type DNSOverTLSDialer interface {
+	DialTLSContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// DNSOverTLSResolver is a resolver using DNSOverTLS. The
+// user of this struct MUST NOT change its fields after initialization
+// because that MAY lead to data races.
+//
+// This struct will serialize the queries sent using the
+// underlying connection such that only a single thread
+// at any given time will have acccess to the conn.
+type DNSOverTLSResolver struct {
+	// Address is the address of the TCP/TLS server to use. It
+	// MUST be set by the user before using this struct. If not
+	// set, then this code will obviously fail.
+	Address string
+
+	// Codec is the optional DNSCodec to use. If not set, then
+	// we will use the default miekg/dns codec.
+	Codec DNSCodec
+
+	// Dialer is the optional Dialer to use. If not set, then
+	// we will use a default constructed Dialer struct.
+	Dialer DNSOverTLSDialer
+
+	// mu provides synchronization.
+	mu sync.Mutex
+
+	// reso is the resolver implementation.
+	reso *dnsOverTCPTLSResolver
+}
+
+// LookupHost implements DNSUnderlyingResolver.LookupHost. This
+// function WILL NOT wrap the returned error. We assume that
+// this job is performed by DNSResolver, which should be used
+// as a wrapper type for this type.
+func (r *DNSOverTLSResolver) LookupHost(
+	ctx context.Context, hostname string) ([]string, error) {
+	r.mu.Lock()
+	if r.reso == nil {
+		r.reso = &dnsOverTCPTLSResolver{
+			address: r.Address,
+			codec:   r.codec(),
+			dial:    r.dialer().DialTLSContext,
+			padding: true,
+		}
+	}
+	r.mu.Unlock()
+	return r.reso.LookupHost(ctx, hostname)
+}
+
+// codec returns the DNSCodec to use.
+func (r *DNSOverTLSResolver) codec() DNSCodec {
+	if r.Codec != nil {
+		return r.Codec
+	}
+	return &dnsMiekgCodec{}
+}
+
+// dialer returns the Dialer to use.
+func (r *DNSOverTLSResolver) dialer() DNSOverTLSDialer {
+	if r.Dialer != nil {
+		return r.Dialer
+	}
+	return &Dialer{ALPN: []string{"dot"}}
+}
+
+// CloseIdleConnections closes the idle connections.
+func (r *DNSOverTLSResolver) CloseIdleConnections() {
+	r.mu.Lock()
+	reso := r.reso
+	r.mu.Unlock()
+	if reso != nil {
+		reso.CloseIdleConnections()
+	}
+}
+
+// dnsOverTCPTLSResolver is a DNS resolver that uses either
+// TCP or TLS depending on how it's configured. The user
+// of this struct MUST NOT change its fields after initialization
+// because that MAY lead to data races.
+//
+// This struct will serialize the queries sent using the
+// underlying connection such that only a single thread
+// at any given time will have acccess to the conn.
+//
+// This struct will create the required internal state
+// the first time such state is actually needed.
+type dnsOverTCPTLSResolver struct {
+	// address is the address of the TCP/TLS server to use. It
+	// MUST be set by the user before using this struct.
+	address string
+
+	// conn is the persistent connection. It will be
+	// initialized on demand when it's needed.
+	conn net.Conn
+
+	// codec is the DNSCodec to use. It MUST be set
+	// by the user before using this struct.
+	codec DNSCodec
+
+	// dial is the function to dial. It MUST be set
+	// by the user before using this struct.
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
+
+	// padding indicates whether we need padding. It MAY
+	// be set by the user before using this struct.
+	padding bool
+
+	// mu ensures there is mutual exclusion.
+	mu sync.Mutex
+
+	// users is the atomic number of users that are
+	// currently using this data structure.
+	users int32
+}
+
+// LookupHost performs an host lookup.
+func (r *dnsOverTCPTLSResolver) LookupHost(
+	ctx context.Context, hostname string) ([]string, error) {
+	return (&dnsGenericResolver{
+		codec:   r.codec,
+		padding: true,
+		t:       r,
+	}).LookupHost(ctx, hostname)
+}
+
+// roundTrip implements dnsTransport.roundTrip.
+func (r *dnsOverTCPTLSResolver) roundTrip(
+	ctx context.Context, query []byte) ([]byte, error) {
+	atomic.AddInt32(&r.users, 1)            // know number of waiters
+	r.mu.Lock()                             // concurrent goroutines will park here
+	atomic.AddInt32(&r.users, -1)           // we are not waiting anymore
+	reply, err := r.rtriplocked(ctx, query) // do round trip
+	r.mu.Unlock()                           // next goroutine can now proceed
+	return reply, err
+}
+
+// rtriplocked is the locked part of roundTrip.
+func (r *dnsOverTCPTLSResolver) rtriplocked(
+	ctx context.Context, query []byte) ([]byte, error) {
+	if query == nil {
+		// This special sentinel value indicates that
+		// we want to close the idle connections if we're
+		// the only one who's using it now. Otherwise,
+		// we'll just take a short trip in here and leave.
+		if atomic.LoadInt32(&r.users) == 0 && r.conn != nil {
+			r.conn.Close()
+			r.conn = nil
+		}
+		return nil, nil
+	}
+	return r.do(ctx, query)
+}
+
+// errDNSOverTCPTLSRedial indicates that we should dial
+// again because the connection was immediately lost.
+type errDNSOverTCPTLSRedial struct {
+	error
+}
+
+// do implements sending a query and receiving the reply
+// over a TCP or TLS persistent channel. This function
+// assumes to have exclusive access to the conn.
+func (dl *dnsOverTCPTLSResolver) do(
+	ctx context.Context, query []byte) ([]byte, error) {
+	if err := dl.maybeDial(ctx); err != nil {
+		return nil, err
+	}
+	reply, err := dl.try(ctx, query)
+	if err == nil {
+		return reply, nil
+	}
+	var redial *errDNSOverTCPTLSRedial
+	if !errors.As(err, &redial) {
+		return nil, err // this error was not a redial hint
+	}
+	if err := dl.forceDial(ctx); err != nil {
+		return nil, err
+	}
+	return dl.try(ctx, query)
+}
+
+// maybeDial dials if the connection is nil. This function
+// assumes to have exclusive access to the conn.
+func (dl *dnsOverTCPTLSResolver) maybeDial(ctx context.Context) error {
+	if dl.conn != nil {
+		return nil
+	}
+	return dl.forceDial(ctx)
+}
+
+// forceDial forces dialing a new connection instance. This function
+// assumes to have exclusive access to the conn.
+func (dl *dnsOverTCPTLSResolver) forceDial(ctx context.Context) error {
+	if dl.conn != nil {
+		dl.conn.Close()
+		dl.conn = nil
+	}
+	conn, err := dl.dial(ctx, "tcp", dl.address)
+	if err != nil {
+		return err
+	}
+	dl.conn = conn
+	return nil
+}
+
+// errDNSOverTCPTLSQueryTooLong indicates that the query is too long.
+var errDNSOverTCPTLSQueryTooLong = errors.New("query too long")
+
+// dnsOverTCPTLSResult contains the result of running the
+// currenct query in a background goroutine.
+type dnsOverTCPTLSResult struct {
+	reply []byte
+	err   error
+}
+
+// try tries to send the query. Because sending and receiving the
+// query is not bound to a context but to network deadlines, we run
+// the I/O in a background goroutine and collect the results. This
+// allows us to react immediately to context cancellation.
+func (dl *dnsOverTCPTLSResolver) try(
+	ctx context.Context, query []byte) ([]byte, error) {
+	ch := make(chan *dnsOverTCPTLSResult, 1) // buffer!
+	go dl.asyncTry(ctx, query, ch)
+	select {
+	case out := <-ch:
+		return out.reply, out.err
+	case <-ctx.Done():
+		return nil, ctx.Err() // the context won
+	}
+}
+
+// asyncTry is the "main" of the background goroutine that
+// does the I/O required to get a DoTCP/DoTLS reply.
+func (dl *dnsOverTCPTLSResolver) asyncTry(
+	ctx context.Context, query []byte, ch chan<- *dnsOverTCPTLSResult) {
+	var out dnsOverTCPTLSResult
+	out.reply, out.err = dl.trySync(ctx, query)
+	ch <- &out
+}
+
+// trySync tries to send the query and receive the reply. This
+// code runs in a background goroutine, so that early cancellation
+// of the context can be serviced by the caller goroutine.
+func (dl *dnsOverTCPTLSResolver) trySync(
+	ctx context.Context, query []byte) ([]byte, error) {
+	if len(query) > math.MaxUint16 {
+		return nil, errDNSOverTCPTLSQueryTooLong
+	}
+	defer dl.conn.SetDeadline(time.Time{})
+	dl.conn.SetDeadline(time.Now().Add(10 * time.Second))
+	// Write request
+	buf := []byte{byte(len(query) >> 8)}
+	buf = append(buf, byte(len(query)))
+	buf = append(buf, query...)
+	if _, err := dl.conn.Write(buf); err != nil {
+		return nil, &errDNSOverTCPTLSRedial{err} // hint for possible redial
+	}
+	// Read response
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(dl.conn, header); err != nil {
+		return nil, err
+	}
+	length := int(header[0])<<8 | int(header[1])
+	reply := make([]byte, length)
+	if _, err := io.ReadFull(dl.conn, reply); err != nil {
+		return nil, err
+	}
+	return reply, nil
+}
+
+// CloseIdleConnections forces the resolver to close
+// any currently idle connection they might have.
+func (r *dnsOverTCPTLSResolver) CloseIdleConnections() {
+	r.roundTrip(context.Background(), nil) // use sentinel value
 }

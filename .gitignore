@@ -6,6 +6,7 @@
 /apitool.exe
 /coverage.cov
 /dohclient
+/dotclient
 /httpclient
 /miniooni
 /miniooni.exe
