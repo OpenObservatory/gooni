@@ -7,6 +7,7 @@ require (
 	github.com/alecthomas/kingpin v2.2.6+incompatible
 	github.com/alecthomas/units v0.0.0-20210208195552-ff826a37aa15 // indirect
 	github.com/apex/log v1.9.0
+	github.com/bassosimone/quic-go v0.19.4-0.20210128135158-0cdd55f73cfd // indirect
 	github.com/creack/goselect v0.1.2 // indirect
 	github.com/cretz/bine v0.1.0
 	github.com/dchest/siphash v1.2.2 // indirect
@@ -31,10 +32,12 @@ require (
 	github.com/pborman/getopt/v2 v2.1.0
 	github.com/pion/stun v0.3.5
 	github.com/pkg/errors v0.9.1
+	github.com/refraction-networking/utls v0.0.0-20201210053706-2179f286686b
 	github.com/rogpeppe/go-internal v1.7.0
 	github.com/rubenv/sql-migrate v0.0.0-20210215143335-f84234893558
 	github.com/sirupsen/logrus v1.7.0 // indirect
 	gitlab.com/yawning/obfs4.git v0.0.0-20201217005658-f638c33f6c6f
+	gitlab.com/yawning/utls.git v0.0.11-1 // indirect
 	golang.org/x/crypto v0.0.0-20210220033148-5ea612d1eb83 // indirect
 	golang.org/x/net v0.0.0-20210226172049-e18ecbb05110
 	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9 // indirect
