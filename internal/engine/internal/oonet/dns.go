@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"math"
 	"net"
 	"net/http"
@@ -46,7 +45,14 @@ type DNSUnderlyingResolver interface {
 	LookupHost(ctx context.Context, hostname string) ([]string, error)
 }
 
-// DNSResolver is a DNS resolver.
+// DNSResolver is the DNS resolver. Its main job is to emit
+// events and to ensure returned errors are wrapped.
+//
+// The real DNS resolution work is demanded to an underlying
+// resolver. The DNSResolver will not own the underlying resolver
+// and will not attempt to reclaim unused connections that the
+// underlying resolver MAY be keeping alive. It is your job
+// to ensure that you are closing such connections when needed.
 //
 // You MUST NOT modify any field of Resolver after construction
 // because this MAY result in a data race.
@@ -68,7 +74,8 @@ func (e *ErrLookupHost) Unwrap() error {
 }
 
 // LookupHost maps a hostname to a list of IP addresses.
-func (r *DNSResolver) LookupHost(ctx context.Context, hostname string) ([]string, error) {
+func (r *DNSResolver) LookupHost(
+	ctx context.Context, hostname string) ([]string, error) {
 	ContextMonitor(ctx).OnDNSLookupHostStart(hostname)
 	ures := r.underlyingResolver()
 	addrs, err := ures.LookupHost(ctx, hostname)
@@ -79,18 +86,6 @@ func (r *DNSResolver) LookupHost(ctx context.Context, hostname string) ([]string
 	return addrs, err
 }
 
-// dnsIdleConnectionsCloser allows to close idle connections.
-type dnsIdleConnectionsCloser interface {
-	CloseIdleConnections()
-}
-
-// CloseIdleConnections closes idle connections.
-func (r *DNSResolver) CloseIdleConnections() {
-	if c, ok := r.underlyingResolver().(dnsIdleConnectionsCloser); ok {
-		c.CloseIdleConnections()
-	}
-}
-
 // underlyingResolver returns the DNSUnderlyingResolver to use.
 func (r *DNSResolver) underlyingResolver() DNSUnderlyingResolver {
 	if r.UnderlyingResolver != nil {
@@ -99,7 +94,10 @@ func (r *DNSResolver) underlyingResolver() DNSUnderlyingResolver {
 	return &net.Resolver{}
 }
 
-// DNSCodec encodes and decodes DNS messages.
+// DNSCodec encodes and decodes DNS messages. In addition to
+// marshalling and unmarshalling, this data structure will also
+// emit an event every time we successfully marshal a query
+// and every time we successfully unmarshal a reply.
 type DNSCodec interface {
 	// EncodeLookupHostRequest encodes a LookupHost request.
 	EncodeLookupHostRequest(ctx context.Context,
@@ -110,7 +108,8 @@ type DNSCodec interface {
 		qtype uint16, data []byte) ([]string, error)
 }
 
-// dnsMiekgCodec is a DNSCodec using miekg/dns.
+// dnsMiekgCodec is a DNSCodec using miekg/dns. This is the
+// codec used by default by this library.
 type dnsMiekgCodec struct{}
 
 // EncodeLookupHostRequest implements DNSCodec.EncodeLookupHostRequest.
@@ -180,7 +179,7 @@ var ErrDNSServerTemporarilyMisbehaving = errors.New("server misbehaving")
 // understand what error was returned by the server.
 var ErrDNSServerMisbehaving = errors.New("server misbehaving")
 
-// DecodeLookupHostRequest implements DNSCodec.DecodeLookupHostRequest.
+// DecodeLookupHostResponse implements DNSCodec.DecodeLookupHostResponse.
 func (c *dnsMiekgCodec) DecodeLookupHostResponse(
 	ctx context.Context, qtype uint16, data []byte) ([]string, error) {
 	reply := new(dns.Msg)
@@ -220,8 +219,7 @@ func (c *dnsMiekgCodec) DecodeLookupHostResponse(
 }
 
 // DNSOverHTTPSHTTPClient is the HTTP client to use. The standard
-// library http.DefaultHTTPClient matches this interface and also
-// HTTP{,X}DefaultClient match this interface.
+// library http.DefaultHTTPClient matches this interface.
 type DNSOverHTTPSHTTPClient interface {
 	// Do should behave like http.Client.Do.
 	Do(req *http.Request) (*http.Response, error)
@@ -230,32 +228,37 @@ type DNSOverHTTPSHTTPClient interface {
 // DNSOverHTTPSResolver is a DNS over HTTPS resolver. You MUST NOT
 // modify any field of this struct once you've initialized it because
 // that MAY likely lead to data races.
+//
+// DNSOverHTTPSResolver WILL NOT wrap returned errors using, e.g.,
+// ErrLookupHost because this is the DNSResolver's job.
+//
+// The DNSOverHTTPSResolver references an underlying HTTP client,
+// however, it DOES NOT OWN such a client. Therefore, it won't
+// attempt to reclaim any unused connections in such a client. It
+// is your responsibility to do that when needed.
+//
+// This resolver will perform the DNS round trip (sending a query
+// and receiving a reply) in a background goroutine. If the context
+// expires before that operation is complete, this resolver will
+// leak such a goroutine and return early. A well behaved HTTP client
+// should be configured such that any I/O operation will eventually
+// timeout. So, if you are using a well behaved HTTP client with
+// this resolver, then goroutine leak will be temporary.
 type DNSOverHTTPSResolver struct {
 	// Client is the optional HTTP client to use. If not set,
-	// then we will use HTTPXDefaultClient. (Because we're
-	// using by default an HTTPX client, you should be able
-	// to use the h3, http3, h2, and http2 schemes when
-	// using this resolver by default.)
+	// then we will use HTTPXDefaultClient.
 	Client DNSOverHTTPSHTTPClient
 
 	// Codec is the DNSCodec to use. If not set, then
 	// we will use a suitable default DNSCodec.
 	Codec DNSCodec
 
-	// OwnsClient indicates whether this struct owns the
-	// HTTP Client or not. If it owns the Client, then
-	// calling CloseIdleConnections will cause the code
-	// to really close idle connections. Otherwise, we
-	// assume Client is a shared Client for which we don't
-	// want to aggressively close connections.
-	OwnsClient bool
-
 	// URL is the mandatory URL of the server. If not set,
 	// then this code will certainly fail.
 	URL string
 
-	// UserAgent is the User-Agent header to use. If not set,
-	// Go standard user agent is used.
+	// UserAgent is the optional User-Agent header to use. If not
+	// set, Golang's standard user agent is used.
 	UserAgent string
 }
 
@@ -280,10 +283,23 @@ func (r *DNSOverHTTPSResolver) codec() DNSCodec {
 	return &dnsMiekgCodec{}
 }
 
-// roundTrip implements dnsTransport.roundTrip
+// dnsOverHTTPSResult is the result of running the DNS
+// round trip in a background goroutine.
+type dnsOverHTTPSResult struct {
+	// data is the data in the response body.
+	data []byte
+
+	// err is the error that occurred.
+	err error
+}
+
+// roundTrip implements dnsTransport.roundTrip. This function
+// will read the body in a background goroutine such that we're
+// able to immediately react to the context being cancelled.
 func (r *DNSOverHTTPSResolver) roundTrip(
 	ctx context.Context, query []byte) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", r.URL, bytes.NewReader(query))
+	req, err := http.NewRequestWithContext(
+		ctx, "POST", r.URL, bytes.NewReader(query))
 	if err != nil {
 		return nil, err
 	}
@@ -301,9 +317,26 @@ func (r *DNSOverHTTPSResolver) roundTrip(
 		return nil, ErrDNSServerTemporarilyMisbehaving
 	}
 	if resp.Header.Get("content-type") != "application/dns-message" {
-		log.Printf("dns: the server did not set the right content type")
+		return nil, ErrDNSServerTemporarilyMisbehaving
 	}
-	return ioutil.ReadAll(resp.Body)
+	ch := make(chan *dnsOverHTTPSResult, 1) // buffer
+	const maxBodySize = 1 << 20
+	go r.readyBodyAsync(resp.Body, maxBodySize, ch)
+	select {
+	case out := <-ch:
+		return out.data, out.err
+	case <-ctx.Done():
+		return nil, ctx.Err() // the context won the race
+	}
+}
+
+// readyBodyAsync is a background goroutine that reads the body
+// and posts the result on the provided channel.
+func (r *DNSOverHTTPSResolver) readyBodyAsync(body io.Reader,
+	limit int64, ch chan<- *dnsOverHTTPSResult) {
+	body = io.LimitReader(body, limit)
+	data, err := ioutil.ReadAll(body)
+	ch <- &dnsOverHTTPSResult{data: data, err: err}
 }
 
 // client returns the DNSOverHTTPSClient to use.
@@ -314,34 +347,70 @@ func (r *DNSOverHTTPSResolver) client() DNSOverHTTPSHTTPClient {
 	return HTTPXDefaultClient
 }
 
-// CloseIdleConnections closes idle connections.
-func (r *DNSOverHTTPSResolver) CloseIdleConnection() {
-	// We only close the idle connections if we own the Client, otherwise we
-	// don't want to aggressively kill connections.
-	if r.OwnsClient {
-		if c, ok := r.client().(dnsIdleConnectionsCloser); ok {
-			c.CloseIdleConnections()
-		}
-	}
-}
-
-// dnsTransport is a DNS transport.
+// dnsTransport is a DNS transport. The job of a transport
+// is to send a query (as a bag of bytes) and implement the
+// proper protocol (e.g. DoH) to read the bytes that will
+// possibly correspond to a DNS reply.
+//
+// If a dnsTransport is not able to deal with concurrent
+// DNS round trips, then is should use locking to prevent
+// more than one concurrent round trip at a time.
+//
+// Implementations of dnsTransport SHOULD honour the
+// context and return immediately when it has been cancelled.
 type dnsTransport interface {
 	// roundTrip performs the DNS round trip.
 	roundTrip(ctx context.Context, data []byte) ([]byte, error)
 }
 
-// dnsGenericResolver is a generic resolver.
+// dnsGenericResolver is a generic resolver. The job of this
+// structure is to generate queries to send, send them via the
+// configured transport, and parse the resulting bytes that
+// are returned by the transport.
+//
+// The dnsGenericResolver MAY issue queries in parallel. A well
+// behaved transport SHOULD use locking if it's not able to deal
+// correctly with queries running in parallel.
+//
+// This type assumes that the transport is able to immediately
+// react to a cancelled context, therefore it DOESN'T check
+// whether the context has been terminated while queries are
+// still pending. That's the transport job, not ours.
 type dnsGenericResolver struct {
-	codec   DNSCodec     // mandatory
-	padding bool         // optional
-	t       dnsTransport // mandatory
+	// codec is the mandatory DNSCodec.
+	codec DNSCodec
+
+	// padding indicates whether we want padding.
+	padding bool
+
+	// t is the mandatory transport.
+	t dnsTransport
 }
 
 // dnsLookupHostResult is the result of a lookupHost operation.
 type dnsLookupHostResult struct {
+	// addrs is the list of returned addresses.
 	addrs []string
-	err   error
+
+	// err is the error (if any).
+	err error
+}
+
+// ErrDNSQuery contains the multiple errors occurred during
+// a query. You MUST construct this error ONLY when both the
+// AAAA and the A query failed.
+type ErrDNSQuery struct {
+	// ErrA is the error occurred during the A query.
+	ErrA error
+
+	// ErrAAAA is the error occurred during the AAAA query.
+	ErrAAAA error
+}
+
+// Error stringifies the error.
+func (e *ErrDNSQuery) Error() string {
+	return fmt.Sprintf("{A error: %s; AAAA error: %s}",
+		e.ErrA.Error(), e.ErrAAAA.Error())
 }
 
 // LookupHost performs a LookupHost operation.
@@ -352,18 +421,21 @@ func (r *dnsGenericResolver) LookupHost(
 	// Implementation note: we can make this parallel very easily and it will
 	// also be significantly more difficult to debug because the events in the
 	// monitor will overlap while the two requests are in progress.
+	// Also note that we don't honour the context because it's the job
+	// of the transport to react to context cancellation.
 	replyA := <-resA
 	go r.asyncLookupHost(ctx, hostname, dns.TypeAAAA, r.padding, resAAAA)
 	replyAAAA := <-resAAAA
 	if replyA.err != nil && replyAAAA.err != nil {
-		return nil, replyA.err
+		err := &ErrDNSQuery{ErrA: replyA.err, ErrAAAA: replyAAAA.err}
+		return nil, err
 	}
 	var addrs []string
 	addrs = append(addrs, replyA.addrs...)
 	addrs = append(addrs, replyAAAA.addrs...)
 	if len(addrs) < 1 {
-		// Note: the transport SHOULD NOT do that but the
-		// implementation may be broken.
+		// Note: the codec SHOULD NOT allow for that but we
+		// want to have a second line of defense here.
 		return nil, ErrDNSNoAsnwerFromDNSServer
 	}
 	return addrs, nil

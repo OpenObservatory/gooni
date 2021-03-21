@@ -26,7 +26,6 @@ func main() {
 			Address: *addr,
 		},
 	}
-	defer resolver.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 	addrs, err := resolver.LookupHost(ctx, *domain)
