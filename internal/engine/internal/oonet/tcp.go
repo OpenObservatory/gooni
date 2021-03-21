@@ -6,7 +6,8 @@ import (
 	"time"
 )
 
-// TCPConnMonitor monitors TCP connections.
+// TCPConnMonitor monitors TCP connections. It may occasionally
+// also monitor connected UDP sockets.
 //
 // The callbacks MUST NOT modify their arguments.
 //
@@ -46,8 +47,8 @@ type TCPUnderlyingConnector interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 }
 
-// TCPConnector establishes TCP connections. This is a low-level
-// primitive for creating connections.
+// TCPConnector establishes TCP connections. It may also be used
+// to connect UDP sockets. This is a low-level primitive.
 //
 // The connector will enforce a maximum timeout when connecting that
 // is independent of the context. When a connect operation fails, the
@@ -157,7 +158,9 @@ func (c *TCPConnector) newDialer(timeout time.Duration) TCPUnderlyingConnector {
 	return &net.Dialer{Timeout: c.ConnectTimeout}
 }
 
-// TCPConn is a TCP connection.
+// TCPConn is a TCP connection. It may also occasionally be
+// a connected UDP socket, which behaves ~like TCP as far as
+// the user of the abstraction is concerned.
 type TCPConn struct {
 	// net.Conn is the underlying connection.
 	net.Conn
