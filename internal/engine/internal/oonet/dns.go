@@ -220,7 +220,7 @@ func (c *dnsMiekgCodec) DecodeLookupHostResponse(
 
 // DNSOverHTTPSHTTPClient is the HTTP client to use. The standard
 // library http.DefaultHTTPClient matches this interface and also
-// HTTPDefaultClient matches this interface.
+// HTTP{,X}DefaultClient match this interface.
 type DNSOverHTTPSHTTPClient interface {
 	// Do should behave like http.Client.Do.
 	Do(req *http.Request) (*http.Response, error)
@@ -404,7 +404,7 @@ type DNSOverTLSDialer interface {
 // underlying connection such that only a single thread
 // at any given time will have acccess to the conn.
 type DNSOverTLSResolver struct {
-	// Address is the address of the TCP/TLS server to use. It
+	// Address is the address of the TLS server to use. It
 	// MUST be set by the user before using this struct. If not
 	// set, then this code will obviously fail.
 	Address string
@@ -668,4 +668,82 @@ func (dl *dnsOverTCPTLSResolver) trySync(
 // any currently idle connection they might have.
 func (r *dnsOverTCPTLSResolver) CloseIdleConnections() {
 	r.roundTrip(context.Background(), nil) // use sentinel value
+}
+
+// DNSOverTCPDialer is the Dialer used by DNSOverTCPResolver.
+type DNSOverTCPDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// DNSOverTCPResolver is a resolver using DNSOverTCP. The
+// user of this struct MUST NOT change its fields after initialization
+// because that MAY lead to data races.
+//
+// This struct will serialize the queries sent using the
+// underlying connection such that only a single thread
+// at any given time will have acccess to the conn.
+type DNSOverTCPResolver struct {
+	// Address is the address of the TCP server to use. It
+	// MUST be set by the user before using this struct. If not
+	// set, then this code will obviously fail.
+	Address string
+
+	// Codec is the optional DNSCodec to use. If not set, then
+	// we will use the default miekg/dns codec.
+	Codec DNSCodec
+
+	// Dialer is the optional Dialer to use. If not set, then
+	// we will use a default constructed Dialer struct.
+	Dialer DNSOverTCPDialer
+
+	// mu provides synchronization.
+	mu sync.Mutex
+
+	// reso is the resolver implementation.
+	reso *dnsOverTCPTLSResolver
+}
+
+// LookupHost implements DNSUnderlyingResolver.LookupHost. This
+// function WILL NOT wrap the returned error. We assume that
+// this job is performed by DNSResolver, which should be used
+// as a wrapper type for this type.
+func (r *DNSOverTCPResolver) LookupHost(
+	ctx context.Context, hostname string) ([]string, error) {
+	r.mu.Lock()
+	if r.reso == nil {
+		r.reso = &dnsOverTCPTLSResolver{
+			address: r.Address,
+			codec:   r.codec(),
+			dial:    r.dialer().DialContext,
+			padding: false,
+		}
+	}
+	r.mu.Unlock()
+	return r.reso.LookupHost(ctx, hostname)
+}
+
+// codec returns the DNSCodec to use.
+func (r *DNSOverTCPResolver) codec() DNSCodec {
+	if r.Codec != nil {
+		return r.Codec
+	}
+	return &dnsMiekgCodec{}
+}
+
+// dialer returns the Dialer to use.
+func (r *DNSOverTCPResolver) dialer() DNSOverTCPDialer {
+	if r.Dialer != nil {
+		return r.Dialer
+	}
+	return &Dialer{}
+}
+
+// CloseIdleConnections closes the idle connections.
+func (r *DNSOverTCPResolver) CloseIdleConnections() {
+	r.mu.Lock()
+	reso := r.reso
+	r.mu.Unlock()
+	if reso != nil {
+		reso.CloseIdleConnections()
+	}
 }
