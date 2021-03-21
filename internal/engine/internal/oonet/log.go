@@ -92,27 +92,27 @@ func (m *LogMonitor) OnHTTPResponseBodyDone(
 	m.logger().Debugf("reading response body... <%d bytes> %+v", len(data), err)
 }
 
-// OnSockConnect is called after a socket connect.
-func (m *LogMonitor) OnSockConnect(
+// OnConnConnect is called after a socket connect.
+func (m *LogMonitor) OnConnConnect(
 	address string, conn net.Conn, elapsed time.Duration, err error) {
 	m.logger().Debugf("connect %s... %+v %s %+v", address,
 		conn.RemoteAddr(), elapsed, err)
 }
 
-// OnSockRead is called after a socket read.
-func (m *LogMonitor) OnSockRead(conn net.Conn, data []byte, err error) {
+// OnConnRead is called after a socket read.
+func (m *LogMonitor) OnConnRead(conn net.Conn, data []byte, err error) {
 	m.logger().Debugf("read %+v... <%d bytes> %+v",
 		conn.RemoteAddr(), len(data), err)
 }
 
-// OnSockWrite is called after a socket write.
-func (m *LogMonitor) OnSockWrite(conn net.Conn, data []byte, err error) {
+// OnConnWrite is called after a socket write.
+func (m *LogMonitor) OnConnWrite(conn net.Conn, data []byte, err error) {
 	m.logger().Debugf("write %+v... <%d bytes> %+v",
 		conn.RemoteAddr(), len(data), err)
 }
 
-// OnSockClose is called before a socket close.
-func (m *LogMonitor) OnSockClose(conn net.Conn) {
+// OnConnClose is called before a socket close.
+func (m *LogMonitor) OnConnClose(conn net.Conn) {
 	m.logger().Debugf("close %+v", conn.RemoteAddr())
 }
 
@@ -129,28 +129,28 @@ func (m *LogMonitor) OnTLSHandshakeDone(lib string, conn net.Conn, config *tls.C
 		lib, config.ServerName, config.NextProtos, err)
 }
 
-// OnUDPReadFrom is called after a ReadFrom.
-func (m *LogMonitor) OnUDPReadFrom(
+// OnDatagramReadFrom is called after a ReadFrom.
+func (m *LogMonitor) OnDatagramReadFrom(
 	conn net.PacketConn, data []byte, addr net.Addr, err error) {
 	m.logger().Debugf("readFrom %+v <%d bytes> %+v %+v",
 		conn.LocalAddr(), len(data), addr, err)
 }
 
-// OnUDPWriteTo is called after a WriteTo.
-func (m *LogMonitor) OnUDPWriteTo(
+// OnDatagramWriteTo is called after a WriteTo.
+func (m *LogMonitor) OnDatagramWriteTo(
 	conn net.PacketConn, data []byte, addr net.Addr, err error) {
 	m.logger().Debugf("writeTo %+v <%d bytes> %+v %+v", conn.LocalAddr(),
 		len(data), addr, err)
 }
 
-// OnUDPListen is called after a UDP listen.
-func (m *LogMonitor) OnUDPListen(
+// OnDatagramListen is called after a UDP listen.
+func (m *LogMonitor) OnDatagramListen(
 	laddr *net.UDPAddr, conn net.PacketConn, err error) {
 	m.logger().Debugf("listen %+v %+v", conn.LocalAddr(), err)
 }
 
-// OnUDPClose is called before closing the UDP connection.
-func (m *LogMonitor) OnUDPClose(conn net.PacketConn) {
+// OnDatagramClose is called before closing the UDP connection.
+func (m *LogMonitor) OnDatagramClose(conn net.PacketConn) {
 	m.logger().Debugf("close %+v", conn.LocalAddr())
 }
 

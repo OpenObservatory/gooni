@@ -69,20 +69,20 @@ func (m *monitorDefault) OnHTTPResponseBodyDone(
 	// nothing
 }
 
-// OnSockConnect implements TCPConnMonitor.OnSockConnect.
-func (m *monitorDefault) OnSockConnect(
+// OnConnConnect implements TCPConnMonitor.OnConnConnect.
+func (m *monitorDefault) OnConnConnect(
 	address string, conn net.Conn, elapsed time.Duration, err error) {
 	// nothing
 }
 
-// OnSockRead implements TCPConnMonitor.OnSockRead.
-func (m *monitorDefault) OnSockRead(conn net.Conn, data []byte, err error) {}
+// OnConnRead implements TCPConnMonitor.OnConnRead.
+func (m *monitorDefault) OnConnRead(conn net.Conn, data []byte, err error) {}
 
-// OnSockWrite implements TCPConnMonitor.OnSockWrite.
-func (m *monitorDefault) OnSockWrite(conn net.Conn, data []byte, err error) {}
+// OnConnWrite implements TCPConnMonitor.OnConnWrite.
+func (m *monitorDefault) OnConnWrite(conn net.Conn, data []byte, err error) {}
 
-// OnSockClose implements TCPConnMonitor.OnSockClose.
-func (m *monitorDefault) OnSockClose(conn net.Conn) {}
+// OnConnClose implements TCPConnMonitor.OnConnClose.
+func (m *monitorDefault) OnConnClose(conn net.Conn) {}
 
 // OnTLSHandshakeStart implements TLSHandshakeMonitor.OnTLSHandshakeStart.
 func (m *monitorDefault) OnTLSHandshakeStart(lib string,
@@ -96,26 +96,26 @@ func (m *monitorDefault) OnTLSHandshakeDone(lib string,
 	// nothing
 }
 
-// OnUDPReadFrom implements QUICMonitor.OnUDPReadFrom.
-func (m *monitorDefault) OnUDPReadFrom(
+// OnDatagramReadFrom implements QUICMonitor.OnDatagramReadFrom.
+func (m *monitorDefault) OnDatagramReadFrom(
 	conn net.PacketConn, data []byte, addr net.Addr, err error) {
 	//nothing
 }
 
-// OnUDPWriteTo implements QUICMonitor.OnUDPWriteTo.
-func (m *monitorDefault) OnUDPWriteTo(
+// OnDatagramWriteTo implements QUICMonitor.OnDatagramWriteTo.
+func (m *monitorDefault) OnDatagramWriteTo(
 	conn net.PacketConn, data []byte, addr net.Addr, err error) {
 	// nothing
 }
 
-// OnUDPListen implements QUICMonitor.OnUDPListen.
-func (m *monitorDefault) OnUDPListen(
+// OnDatagramListen implements QUICMonitor.OnDatagramListen.
+func (m *monitorDefault) OnDatagramListen(
 	laddr *net.UDPAddr, conn net.PacketConn, err error) {
 	// nothing
 }
 
-// OnUDPClose implements QUICMonitor.OnUDPClose.
-func (m *monitorDefault) OnUDPClose(conn net.PacketConn) {
+// OnDatagramClose implements QUICMonitor.OnDatagramClose.
+func (m *monitorDefault) OnDatagramClose(conn net.PacketConn) {
 	// nothing
 }
 

@@ -31,21 +31,21 @@ const QUICHTTP3StatusNoError = 0x100
 // when you are measuring HTTP3. In such case, in fact, the
 // lifetime of connections is managed by HTTP3 code.
 type QUICMonitor interface {
-	// OnUDPReadFrom is called after ReadFrom. You may want to
+	// OnDatagramReadFrom is called after ReadFrom. You may want to
 	// copy the data field or otherwise record its size.
-	OnUDPReadFrom(conn net.PacketConn, data []byte, addr net.Addr, err error)
+	OnDatagramReadFrom(conn net.PacketConn, data []byte, addr net.Addr, err error)
 
-	// OnUDPWriteTo is called after WriteTo. You may want to
+	// OnDatagramWriteTo is called after WriteTo. You may want to
 	// copy the data field or otherwise record its size.
-	OnUDPWriteTo(conn net.PacketConn, data []byte, addr net.Addr, err error)
+	OnDatagramWriteTo(conn net.PacketConn, data []byte, addr net.Addr, err error)
 
-	// OnUDPListen is called after a UDP listen.
-	OnUDPListen(laddr *net.UDPAddr, conn net.PacketConn, err error)
+	// OnDatagramListen is called after a UDP listen.
+	OnDatagramListen(laddr *net.UDPAddr, conn net.PacketConn, err error)
 
-	// OnUDPClose is called before closing a UDP socket. Note that buggy
+	// OnDatagramClose is called before closing a UDP socket. Note that buggy
 	// code MAY cause this code to be called more than once. This is
 	// a bug that should obviously be fixed.
-	OnUDPClose(conn net.PacketConn)
+	OnDatagramClose(conn net.PacketConn)
 
 	// OnQUICHandshakeStart is called before the QUIC handshake.
 	OnQUICHandshakeStart(address string, tlsConf *tls.Config, quicConf *quic.Config)
@@ -75,7 +75,7 @@ type quicDefaultListener struct{}
 func (dl *quicDefaultListener) Listen(
 	ctx context.Context, network string, laddr *net.UDPAddr) (net.PacketConn, error) {
 	conn, err := net.ListenUDP(network, laddr)
-	ContextMonitor(ctx).OnUDPListen(laddr, conn, err)
+	ContextMonitor(ctx).OnDatagramListen(laddr, conn, err)
 	return conn, err
 }
 
@@ -246,7 +246,7 @@ func (s *quicEarlySession) CloseWithError(ec quic.ErrorCode, reason string) erro
 		s.closeErr = err
 	}
 	// Implementation note: if other code paths call pconn.Close we will
-	// still see multiple OnUDPClose events. Also: closing the pconn here
+	// still see multiple OnDatagramClose events. Also: closing the pconn here
 	// will cause "use of closed network connections" down the line. It
 	// is not a big deal, but we just know about this fact.
 	s.pconn.Close()
@@ -297,7 +297,7 @@ func (c *QUICPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	if err != nil {
 		err = &ErrReadFrom{err}
 	}
-	c.monitor.OnUDPReadFrom(c, p[:count], addr, err)
+	c.monitor.OnDatagramReadFrom(c, p[:count], addr, err)
 	return count, addr, err
 }
 
@@ -318,12 +318,12 @@ func (c *QUICPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if err != nil {
 		err = &ErrWriteTo{err}
 	}
-	c.monitor.OnUDPWriteTo(c, p[:count], addr, err)
+	c.monitor.OnDatagramWriteTo(c, p[:count], addr, err)
 	return count, err
 }
 
 // Close closes the PacketConn.
 func (c *QUICPacketConn) Close() error {
-	c.monitor.OnUDPClose(c)
+	c.monitor.OnDatagramClose(c)
 	return c.PacketConn.Close()
 }

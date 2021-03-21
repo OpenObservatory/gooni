@@ -18,25 +18,25 @@ import (
 // when you are measuring HTTP. In such case, in fact, the
 // lifetime of connections is managed by HTTP code.
 type TCPConnMonitor interface {
-	// OnSockConnect is called after any connect operation. The elapsed
+	// OnConnConnect is called after any connect operation. The elapsed
 	// argument is the time spent inside connect.
-	OnSockConnect(address string, conn net.Conn, elapsed time.Duration, err error)
+	OnConnConnect(address string, conn net.Conn, elapsed time.Duration, err error)
 
-	// OnSockRead is called after any read. You may want to copy
+	// OnConnRead is called after any read. You may want to copy
 	// the data field, or otherwise to record its size.
-	OnSockRead(conn net.Conn, data []byte, err error)
+	OnConnRead(conn net.Conn, data []byte, err error)
 
-	// OnSockWrite is called after any write. You may want to copy
+	// OnConnWrite is called after any write. You may want to copy
 	// the data field, or otherwise to record its size.
 	//
 	// Of course, data written on the socket MAY be retransmitted
 	// by the kernel at a later time, if there are losses.
-	OnSockWrite(conn net.Conn, data []byte, err error)
+	OnConnWrite(conn net.Conn, data []byte, err error)
 
-	// OnSockClose is called before the connection is closed. If the
+	// OnConnClose is called before the connection is closed. If the
 	// code is buggy, this callback MAY be called more than
 	// once. In such a case, we have a bug to fix.
-	OnSockClose(conn net.Conn)
+	OnConnClose(conn net.Conn)
 }
 
 // TCPUnderlyingConnector is the underlying primitive allowing
@@ -113,7 +113,7 @@ func (c *TCPConnector) DialContext(
 	elapsed := time.Since(start)
 	if err != nil {
 		err = &ErrConnect{err}
-		ContextMonitor(ctx).OnSockConnect(address, nil, elapsed, err)
+		ContextMonitor(ctx).OnConnConnect(address, nil, elapsed, err)
 		return nil, err
 	}
 	conn = &TCPConn{
@@ -122,7 +122,7 @@ func (c *TCPConnector) DialContext(
 		readTimeout:  c.readTimeout(),
 		writeTimeout: c.writeTimeout(),
 	}
-	ContextMonitor(ctx).OnSockConnect(address, conn, elapsed, nil)
+	ContextMonitor(ctx).OnConnConnect(address, conn, elapsed, nil)
 	return conn, nil
 }
 
@@ -196,7 +196,7 @@ func (c *TCPConn) Read(b []byte) (int, error) {
 	if err != nil {
 		err = &ErrRead{err}
 	}
-	c.monitor.OnSockRead(c, b[:count], err)
+	c.monitor.OnConnRead(c, b[:count], err)
 	return count, err
 }
 
@@ -218,7 +218,7 @@ func (c *TCPConn) Write(b []byte) (int, error) {
 	if err != nil {
 		err = &ErrWrite{err}
 	}
-	c.monitor.OnSockWrite(c, b[:count], err)
+	c.monitor.OnConnWrite(c, b[:count], err)
 	return count, err
 }
 
@@ -259,6 +259,6 @@ func (c *TCPConn) RemoteAddr() net.Addr {
 // connections, because these are bugs and we want to
 // see them. Every connection SHOULD only be closed once.
 func (c *TCPConn) Close() error {
-	c.monitor.OnSockClose(c)
+	c.monitor.OnConnClose(c)
 	return c.Conn.Close()
 }
