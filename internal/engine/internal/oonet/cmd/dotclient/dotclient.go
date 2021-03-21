@@ -22,7 +22,7 @@ func main() {
 	monitor := &oonet.LogMonitor{}
 	ctx := oonet.WithMonitor(context.Background(), monitor) // tracing: ON
 	resolver := &oonet.DNSResolver{
-		UnderlyingResolver: &oonet.DNSOverUDPResolver{
+		UnderlyingResolver: &oonet.DNSOverTLSResolver{
 			Address: *addr,
 		},
 	}
