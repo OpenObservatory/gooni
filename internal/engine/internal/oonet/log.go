@@ -92,28 +92,28 @@ func (m *LogMonitor) OnHTTPResponseBodyDone(
 	m.logger().Debugf("reading response body... <%d bytes> %+v", len(data), err)
 }
 
-// OnTCPConnect is called after a TCP connect.
-func (m *LogMonitor) OnTCPConnect(
+// OnSockConnect is called after a socket connect.
+func (m *LogMonitor) OnSockConnect(
 	address string, conn net.Conn, elapsed time.Duration, err error) {
-	m.logger().Debugf("tcpConnect %s... %+v %s %+v", address,
+	m.logger().Debugf("connect %s... %+v %s %+v", address,
 		conn.RemoteAddr(), elapsed, err)
 }
 
-// OnTCPRead is called after a TCP read.
-func (m *LogMonitor) OnTCPRead(conn net.Conn, data []byte, err error) {
-	m.logger().Debugf("tcpRead %+v... <%d bytes> %+v",
+// OnSockRead is called after a socket read.
+func (m *LogMonitor) OnSockRead(conn net.Conn, data []byte, err error) {
+	m.logger().Debugf("read %+v... <%d bytes> %+v",
 		conn.RemoteAddr(), len(data), err)
 }
 
-// OnTCPWrite is called after a TCP write.
-func (m *LogMonitor) OnTCPWrite(conn net.Conn, data []byte, err error) {
-	m.logger().Debugf("tcpWrite %+v... <%d bytes> %+v",
+// OnSockWrite is called after a socket write.
+func (m *LogMonitor) OnSockWrite(conn net.Conn, data []byte, err error) {
+	m.logger().Debugf("write %+v... <%d bytes> %+v",
 		conn.RemoteAddr(), len(data), err)
 }
 
-// OnTCPClose is called after a TCP close.
-func (m *LogMonitor) OnTCPClose(conn net.Conn) {
-	m.logger().Debugf("tcpClose %+v", conn.RemoteAddr())
+// OnSockClose is called before a socket close.
+func (m *LogMonitor) OnSockClose(conn net.Conn) {
+	m.logger().Debugf("close %+v", conn.RemoteAddr())
 }
 
 // OnTLSHandshakeStart is called at the beginning of the TLS handshake
@@ -132,26 +132,26 @@ func (m *LogMonitor) OnTLSHandshakeDone(lib string, conn net.Conn, config *tls.C
 // OnUDPReadFrom is called after a ReadFrom.
 func (m *LogMonitor) OnUDPReadFrom(
 	conn net.PacketConn, data []byte, addr net.Addr, err error) {
-	m.logger().Debugf("udpReadFrom %+v <%d bytes> %+v %+v",
+	m.logger().Debugf("readFrom %+v <%d bytes> %+v %+v",
 		conn.LocalAddr(), len(data), addr, err)
 }
 
 // OnUDPWriteTo is called after a WriteTo.
 func (m *LogMonitor) OnUDPWriteTo(
 	conn net.PacketConn, data []byte, addr net.Addr, err error) {
-	m.logger().Debugf("udpWriteTo %+v <%d bytes> %+v %+v", conn.LocalAddr(),
+	m.logger().Debugf("writeTo %+v <%d bytes> %+v %+v", conn.LocalAddr(),
 		len(data), addr, err)
 }
 
 // OnUDPListen is called after a UDP listen.
 func (m *LogMonitor) OnUDPListen(
 	laddr *net.UDPAddr, conn net.PacketConn, err error) {
-	m.logger().Debugf("udpListen %+v %+v", conn.LocalAddr(), err)
+	m.logger().Debugf("listen %+v %+v", conn.LocalAddr(), err)
 }
 
 // OnUDPClose is called before closing the UDP connection.
 func (m *LogMonitor) OnUDPClose(conn net.PacketConn) {
-	m.logger().Debugf("udpClose %+v", conn.LocalAddr())
+	m.logger().Debugf("close %+v", conn.LocalAddr())
 }
 
 // OnQUICHandshakeStart is called before the QUIC handshake starts.

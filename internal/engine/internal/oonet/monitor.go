@@ -69,20 +69,20 @@ func (m *monitorDefault) OnHTTPResponseBodyDone(
 	// nothing
 }
 
-// OnTCPConnect implements TCPConnMonitor.OnTCPConnect.
-func (m *monitorDefault) OnTCPConnect(
+// OnSockConnect implements TCPConnMonitor.OnSockConnect.
+func (m *monitorDefault) OnSockConnect(
 	address string, conn net.Conn, elapsed time.Duration, err error) {
 	// nothing
 }
 
-// OnTCPRead implements TCPConnMonitor.OnTCPRead.
-func (m *monitorDefault) OnTCPRead(conn net.Conn, data []byte, err error) {}
+// OnSockRead implements TCPConnMonitor.OnSockRead.
+func (m *monitorDefault) OnSockRead(conn net.Conn, data []byte, err error) {}
 
-// OnTCPWrite implements TCPConnMonitor.OnTCPWrite.
-func (m *monitorDefault) OnTCPWrite(conn net.Conn, data []byte, err error) {}
+// OnSockWrite implements TCPConnMonitor.OnSockWrite.
+func (m *monitorDefault) OnSockWrite(conn net.Conn, data []byte, err error) {}
 
-// OnTCPClose implements TCPConnMonitor.OnTCPClose.
-func (m *monitorDefault) OnTCPClose(conn net.Conn) {}
+// OnSockClose implements TCPConnMonitor.OnSockClose.
+func (m *monitorDefault) OnSockClose(conn net.Conn) {}
 
 // OnTLSHandshakeStart implements TLSHandshakeMonitor.OnTLSHandshakeStart.
 func (m *monitorDefault) OnTLSHandshakeStart(lib string,
