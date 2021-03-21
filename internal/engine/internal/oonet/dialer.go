@@ -99,7 +99,9 @@ type Dialer struct {
 	TLSHandshaker *TLSHandshaker
 }
 
-// ErrDial is an error when dialing.
+// ErrDial is an error when dialing. Since we try all the
+// available addresses, this error includes all the failures that
+// occurred, as a list of errors.
 type ErrDial struct {
 	// Errors contains all errors that occurred. They may be one
 	// or more errors depending on what has happened.

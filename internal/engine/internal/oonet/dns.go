@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -746,4 +747,141 @@ func (r *DNSOverTCPResolver) CloseIdleConnections() {
 	if reso != nil {
 		reso.CloseIdleConnections()
 	}
+}
+
+// DNSOverUDPDialer is the Dialer used by DNSOverUDPResolver.
+type DNSOverUDPDialer interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// DNSOverUDPResolver is a resolver using DNSOverUDP. The
+// user of this struct MUST NOT change its fields after initialization
+// because that MAY lead to data races.
+type DNSOverUDPResolver struct {
+	// Address is the address of the UDP server to use. It
+	// MUST be set by the user before using this struct. If not
+	// set, then this code will obviously fail.
+	Address string
+
+	// Codec is the optional DNSCodec to use. If not set, then
+	// we will use the default miekg/dns codec.
+	Codec DNSCodec
+
+	// Dialer is the optional Dialer to use. If not set, then
+	// we will use a default constructed Dialer struct.
+	Dialer DNSOverUDPDialer
+}
+
+// ErrDNSUDPLookup is an error during an UDP lookup. Since we
+// try more than once, this error includes all the failures that
+// occurred, as a list of errors.
+type ErrDNSUDPLookup struct {
+	// Errors contains all errors that occurred. They may be one
+	// or more errors depending on what has happened.
+	Errors []error
+}
+
+// Error returns the error string.
+func (e *ErrDNSUDPLookup) Error() string {
+	if len(e.Errors) == 1 {
+		return e.Errors[0].Error() // optimisation for better clarity
+	}
+	return fmt.Sprintf("dnsUDPLookup: %+v", e.Errors)
+}
+
+// LookupHost implements DNSUnderlyingResolver.LookupHost. This
+// function WILL NOT wrap the returned error. We assume that
+// this job is performed by DNSResolver, which should be used
+// as a wrapper type for this type.
+func (r *DNSOverUDPResolver) LookupHost(
+	ctx context.Context, hostname string) ([]string, error) {
+	overall := &ErrDNSUDPLookup{}
+	for i := 0; i < 3; i++ {
+		addrs, err := (&dnsGenericResolver{
+			codec:   r.codec(),
+			padding: false,
+			t:       r,
+		}).LookupHost(ctx, hostname)
+		if err != nil {
+			overall.Errors = append(overall.Errors, err)
+			continue
+		}
+		return addrs, nil
+	}
+	return nil, overall
+}
+
+// codec returns the DNSCodec to use.
+func (r *DNSOverUDPResolver) codec() DNSCodec {
+	if r.Codec != nil {
+		return r.Codec
+	}
+	return &dnsMiekgCodec{}
+}
+
+// dnsOverUDPResult contains the result of running the
+// currenct query in a background goroutine.
+type dnsOverUDPResult struct {
+	reply []byte
+	err   error
+}
+
+// roundTrip implements dnsTransport.roundTrip. We run the real
+// query in a background goroutine, so we can react without delays
+// if the context has been cancelled by the user.
+func (r *DNSOverUDPResolver) roundTrip(
+	ctx context.Context, query []byte) ([]byte, error) {
+	ch := make(chan *dnsOverUDPResult, 1) // buffer!
+	go r.asyncRoundTrip(ctx, query, ch)
+	select {
+	case out := <-ch:
+		return out.reply, out.err
+	case <-ctx.Done():
+		return nil, ctx.Err() // the context won
+	}
+}
+
+// asyncRoundTrip is the "main" of the goroutine that runs the
+// specific DNS round trip in the background.
+func (r *DNSOverUDPResolver) asyncRoundTrip(
+	ctx context.Context, query []byte, ch chan<- *dnsOverUDPResult) {
+	out := &dnsOverUDPResult{}
+	out.reply, out.err = r.syncRoundTrip(ctx, query)
+	ch <- out
+}
+
+// syncRoundTrip is the sync round trip running in a background
+// goroutine, so the caller goroutine can honor the context.
+func (r *DNSOverUDPResolver) syncRoundTrip(ctx context.Context,
+	query []byte) ([]byte, error) {
+	// TODO(bassosimone): dialing every time may cause an extra DNS
+	// lookup per DNS query, so this is not very smart. At the
+	// same time, because we set a deadline, we cannot easily have
+	// parallel queries on the same socket (maybe?).
+	conn, err := r.dialer().DialContext(ctx, "udp", r.Address)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	// Use five seconds timeout like Bionic does. See
+	// https://labs.ripe.net/Members/baptiste_jonglez_1/persistent-dns-connections-for-reliability-and-performance
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err = conn.Write(query); err != nil {
+		return nil, err
+	}
+	reply := make([]byte, 1<<17)
+	var count int
+	count, err = conn.Read(reply)
+	if err != nil {
+		return nil, err
+	}
+	return reply[:count], nil
+}
+
+// dialer returns the Dialer to use.
+func (r *DNSOverUDPResolver) dialer() DNSOverUDPDialer {
+	if r.Dialer != nil {
+		return r.Dialer
+	}
+	return &Dialer{}
 }
