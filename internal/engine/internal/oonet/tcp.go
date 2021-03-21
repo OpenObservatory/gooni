@@ -58,9 +58,11 @@ type TCPUnderlyingConnector interface {
 // instance will wrap read errors with *ErrRead. Likewise, it will
 // wrap write errors using *ErrWrite.
 //
-// There will always be a timeout for reading or writing. This allows
-// us to unstuck connections that naturally get stuck in case the
-// network where we are is injecting TCP segments.
+// By default there is no timeout for reading and writing. This
+// addresses the use case when you are managing the connection
+// yourself. If you're using HTTP, instead, you SHOULD set both
+// timeouts because we have seen censored networks where this
+// would otherwise block the probe basically forever.
 //
 // You SHOULD only pass to TCPConnector endpoints containing IP
 // addresses. If you pass a domain name, this will work, and will
@@ -80,12 +82,12 @@ type TCPConnector struct {
 	// hook mainly to facilitate unit testing.
 	NewDialer func(timeout time.Duration) TCPUnderlyingConnector
 
-	// ReadTimeout is the optional timeout for read operations. No
-	// timeout means we will use a default timeout.
+	// ReadTimeout is the optional timeout for read operations. Zero
+	// or negative implies there's no timeout
 	ReadTimeout time.Duration
 
-	// WriteTimeout is the optional timeout for write operations. No
-	// timeout means we will use a default timeout.
+	// WriteTimeout is the optional timeout for write operations. Zero
+	// or negative implies there's no timeout
 	WriteTimeout time.Duration
 }
 
@@ -119,8 +121,8 @@ func (c *TCPConnector) DialContext(
 	conn = &TCPConn{
 		Conn:         conn,
 		monitor:      ContextMonitor(ctx),
-		readTimeout:  c.readTimeout(),
-		writeTimeout: c.writeTimeout(),
+		readTimeout:  c.ReadTimeout,
+		writeTimeout: c.WriteTimeout,
 	}
 	ContextMonitor(ctx).OnConnConnect(address, conn, elapsed, nil)
 	return conn, nil
@@ -132,22 +134,6 @@ func (c *TCPConnector) connectTimeout() time.Duration {
 		return c.ConnectTimeout
 	}
 	return 15 * time.Second
-}
-
-// readTimeout returns a valid read timeout to use.
-func (c *TCPConnector) readTimeout() time.Duration {
-	if c.ReadTimeout > 0 {
-		return c.ReadTimeout
-	}
-	return 60 * time.Second
-}
-
-// writeTimeout returns a valid write timeout to use.
-func (c *TCPConnector) writeTimeout() time.Duration {
-	if c.WriteTimeout > 0 {
-		return c.WriteTimeout
-	}
-	return 60 * time.Second
 }
 
 // newDialer creates a new TCPConnectorDialer instance
@@ -190,8 +176,10 @@ func (e *ErrRead) Unwrap() error {
 
 // Read reads data from the underlying connection.
 func (c *TCPConn) Read(b []byte) (int, error) {
-	c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout))
-	defer c.Conn.SetDeadline(time.Time{})
+	if c.readTimeout > 0 {
+		c.Conn.SetReadDeadline(time.Now().Add(c.readTimeout))
+		defer c.Conn.SetDeadline(time.Time{})
+	}
 	count, err := c.Conn.Read(b)
 	if err != nil {
 		err = &ErrRead{err}
@@ -212,8 +200,10 @@ func (e *ErrWrite) Unwrap() error {
 
 // Write writes data to the underlying connection.
 func (c *TCPConn) Write(b []byte) (int, error) {
-	c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
-	defer c.Conn.SetDeadline(time.Time{})
+	if c.writeTimeout > 0 {
+		c.Conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+		defer c.Conn.SetDeadline(time.Time{})
+	}
 	count, err := c.Conn.Write(b)
 	if err != nil {
 		err = &ErrWrite{err}

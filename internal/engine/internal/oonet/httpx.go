@@ -122,7 +122,7 @@ func (t *HTTPXTransport) newHTTP3Transport() HTTPXCloseableTransport {
 
 // CloseIdleConnections closes the idle connections.
 func (t *HTTPXTransport) CloseIdleConnections() {
-	t.mu.Lock() // avoid races when accessing tw
+	t.mu.Lock() // avoid races when accessing the transports
 	standardTransport := t.standardTransport
 	parrotTransport := t.parrotTransport
 	http3Transport := t.http3Transport

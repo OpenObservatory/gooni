@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"flag"
-	"io/ioutil"
 	"net/http"
 
 	"github.com/apex/log"
@@ -29,7 +28,7 @@ func main() {
 		log.WithError(err).Fatal("oonet.HTTPXDefaultClient.Do failed")
 	}
 	defer resp.Body.Close()
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := oonet.HTTPBodyReadAll(ctx, resp.Body, 1<<20, resp.Close)
 	if err != nil {
 		log.WithError(err).Fatal("ioutil.ReadAll failed")
 	}

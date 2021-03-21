@@ -46,10 +46,10 @@ func (m *monitorDefault) OnDNSLookupHostDone(
 }
 
 // OnDNSSendQuery implements DNSMonitor.OnDNSSendQuery.
-func (m *monitorDefault) OnDNSSendQuery(query string) {}
+func (m *monitorDefault) OnDNSSendQuery(query *DNSQuery) {}
 
 // OnDNSRecvReply implements DNSMonitor.OnDNSRecvReply.
-func (m *monitorDefault) OnDNSRecvReply(reply string) {}
+func (m *monitorDefault) OnDNSRecvReply(reply *DNSReply) {}
 
 // OnHTTPRoundTripStart implements HTTPMonitor.OnHTTPRoundTripStart.
 func (m *monitorDefault) OnHTTPRoundTripStart(req *http.Request) {}
@@ -57,15 +57,6 @@ func (m *monitorDefault) OnHTTPRoundTripStart(req *http.Request) {}
 // OnHTTPRoundTripDone implements HTTPMonitor.OnHTTPRoundTripDone.
 func (m *monitorDefault) OnHTTPRoundTripDone(
 	req *http.Request, resp *http.Response, err error) {
-	// nothing
-}
-
-// OnHTTPResponseBodyStart implements HTTPMonitor.OnHTTPResponseBodyStart.
-func (m *monitorDefault) OnHTTPResponseBodyStart(resp *http.Response) {}
-
-// OnHTTPResponseBodyDone implements HTTPMonitor.OnHTTPResponseBodyDone.
-func (m *monitorDefault) OnHTTPResponseBodyDone(
-	resp *http.Response, data []byte, err error) {
 	// nothing
 }
 

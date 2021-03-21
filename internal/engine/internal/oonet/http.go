@@ -1,7 +1,6 @@
 package oonet
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -12,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bassosimone/quic-go"
 	"github.com/bassosimone/quic-go/http3"
@@ -25,12 +25,6 @@ var HTTPSALPN = []string{"http/1.1", "h2"}
 // HTTPMonitor monitors HTTP events. The callbacks MUST NOT
 // modify the provided values. Callbacks MAY be called by
 // background goroutines and we assume this is fine for the monitor.
-//
-// If you are using the standard transport defined by this
-// package, you will see the body callbacks being called
-// during RoundTrip. This is by design because our default
-// configuration is that we pre-read the bodies. See the
-// docs of HTTPTransactioner for more info.
 type HTTPMonitor interface {
 	// OnHTTPRoundTripStart is called before sending the request.
 	OnHTTPRoundTripStart(req *http.Request)
@@ -39,38 +33,11 @@ type HTTPMonitor interface {
 	// request and reading the response headers. In case of error, the
 	// resp field will of course be nil (and the err not nil).
 	OnHTTPRoundTripDone(req *http.Request, resp *http.Response, err error)
-
-	// OnHTTPResponseBodyStart is called when we start reading
-	// the body of the HTTP response. The response won't be nil
-	// and you can get the request from the response.
-	//
-	// If you are using an HTTPTransactioner (which is what
-	// will most likely happens), you will see this event emitted
-	// when you're inside RoundTrip. This happens because we
-	// pre-read the response body in the HTTPTransactioner.
-	OnHTTPResponseBodyStart(resp *http.Response)
-
-	// OnHTTPResponseBodyDone is called when we're done reading
-	// the response body. The error indicates whether we could
-	// read the whole body or there were some issues. The response
-	// won't be nil so you can use it to get the request.
-	//
-	// If you are using an HTTPTransactioner (which is what
-	// will most likely happens), you will see this event emitted
-	// when you're inside RoundTrip. This happens because we
-	// pre-read the response body in the HTTPTransactioner.
-	OnHTTPResponseBodyDone(resp *http.Response, data []byte, err error)
 }
 
 // HTTPTransactioner is an HTTP transport that performs
 // the HTTP transaction initiated by a request and completed
 // by the receipt of a response.
-//
-// The transactioner will read the response body up to
-// a maximum-body-size limit and return such a body as the
-// resp.Body. See the docs of RoundTrip for details,
-// including an explanation of why we chose this design
-// and what happens if the body is too large.
 //
 // This struct is compatible with several kinds of underlying
 // round trippers, including the standard library's one,
@@ -78,18 +45,11 @@ type HTTPMonitor interface {
 // work out of the box as the underlying RoundTripper.
 //
 // The transactioner will also emit the "round trip start",
-// "round trip done", "body read start", and "body read done"
-// events through the ContextMonitor.
+// and "round trip done" events via the ContextMonitor.
 //
 // You MUST NOT modify any field of HTTPTransactioner after
 // construction because this MAY result in a data race.
 type HTTPTransactioner struct {
-	// MaxBodySize is the maximum body size. Any body larger than
-	// this will yield ErrHTTPBodyTruncated when reading the
-	// response body. If this setting is zero or negative, then we'll
-	// use a reasonably-large default.
-	MaxBodySize int64
-
 	// RoundTripper is the underlying http.RoundTripper we
 	// should be using. If this is not set, then we'll
 	// use the http.DefaultTransport round tripper.
@@ -106,49 +66,17 @@ func (e *ErrHTTP) Unwrap() error {
 	return e.error
 }
 
-// RoundTrip sends a request and returns the response.
-//
-// This function will ALSO read the body up until the configured
-// maximum size. The returned response contains a new body that reads
-// from memory and reproduces the error encountered reading the
-// body (if any). If the body is larger than the maximum size, you
-// get ErrHTTPBodyTruncated when reading from it after you have
-// read enough bytes.
-//
-// This particular body-reading design allows us to tell people
-// to write the code they are used to without wondering of whether the
-// operation of reading the body needs to be context bounded. If the context
-// expires before we finished to read the body, this code will leak a
-// goroutine until the body-reading operation has been completed (or until
-// any configured timeout in the socket expires).
-//
-// All the errors returned by this function are ErrHTTP instances.
+// RoundTrip sends a request and returns the response. All the
+// errors returned by this function are ErrHTTP instances.
 func (t *HTTPTransactioner) RoundTrip(req *http.Request) (*http.Response, error) {
 	ctx := req.Context()
 	ContextMonitor(ctx).OnHTTPRoundTripStart(req)
 	resp, err := t.roundTripper().RoundTrip(req)
 	if err != nil {
 		err = &ErrHTTP{err}
-		ContextMonitor(ctx).OnHTTPRoundTripDone(req, nil, err)
-		return nil, err
 	}
-	ContextMonitor(ctx).OnHTTPRoundTripDone(req, resp, nil)
-	ContextMonitor(ctx).OnHTTPResponseBodyStart(resp)
-	bodychan := make(chan *httpResponseBody, 1)
-	// Note: readBody takes ownership of the response body.
-	go func(ctx context.Context, body io.ReadCloser, eofOK bool) {
-		bodychan <- t.readBody(ctx, body, eofOK)
-	}(ctx, resp.Body, resp.Close)
-	select {
-	case <-ctx.Done(): // context canceled while waiting for the body
-		err := &ErrHTTP{ctx.Err()}
-		ContextMonitor(ctx).OnHTTPResponseBodyDone(resp, nil, err)
-		return nil, err
-	case b := <-bodychan: // we got (some part of) the resp.Body
-		resp.Body = b.ReadCloser // allows replay of reading body
-		ContextMonitor(ctx).OnHTTPResponseBodyDone(resp, b.data, nil)
-		return resp, nil
-	}
+	ContextMonitor(ctx).OnHTTPRoundTripDone(req, resp, err)
+	return resp, err
 }
 
 // roundTripper returns the http.RoundTripper to use.
@@ -157,68 +85,6 @@ func (t *HTTPTransactioner) roundTripper() http.RoundTripper {
 		return t.RoundTripper
 	}
 	return http.DefaultTransport
-}
-
-// ErrHTTPBodyTruncated indicates that the body was too large and
-// therefore we truncated it once we've read up to the limit.
-var ErrHTTPBodyTruncated = errors.New("oonet: HTTP body was truncated")
-
-// httpResponseBody contains the HTTP response body.
-type httpResponseBody struct {
-	data []byte
-	io.ReadCloser
-}
-
-// readBody reads the response body up until the configured limit. It
-// returns a new reader that will allow the caller to read the body
-// again just like it was reading it "now". We will return the same bytes
-// and then the error that occurred, if any. If the body is too long,
-// the returned body's reader will return the maximum amount of bytes and
-// then ErrHTTPBodyTruncated to signal the truncation.
-//
-// This function WILL TAKE OWNERSHIP of the body. This means it will
-// ensure to call Close when done reading it.
-func (t *HTTPTransactioner) readBody(
-	ctx context.Context, body io.ReadCloser, expectEOF bool) *httpResponseBody {
-	defer body.Close()
-	maxBodySize := t.maxBodySize()
-	r := io.LimitReader(body, maxBodySize)
-	data, err := ioutil.ReadAll(r)
-	if errors.Is(err, io.EOF) && expectEOF {
-		err = nil // we expected to see end of file
-	}
-	if err == nil && int64(len(data)) >= maxBodySize {
-		err = ErrHTTPBodyTruncated
-	}
-	return &httpResponseBody{
-		data: data,
-		ReadCloser: ioutil.NopCloser(io.MultiReader(
-			bytes.NewReader(data), &httpBodyErrorReader{err},
-		)),
-	}
-}
-
-// httpBodyErrorReader is a reader that always returns
-// the configured error whenever one tries to read. When
-// we have no configured error, we just return io.EOF.
-type httpBodyErrorReader struct {
-	err error
-}
-
-// Read implements io.Reader.
-func (b *httpBodyErrorReader) Read(d []byte) (int, error) {
-	if b.err == nil {
-		return 0, io.EOF
-	}
-	return 0, b.err
-}
-
-// maxBodySize returns the maximum body size.
-func (t *HTTPTransactioner) maxBodySize() int64 {
-	if t.MaxBodySize > 0 {
-		return t.MaxBodySize
-	}
-	return 1 << 22
 }
 
 // httpCloseIdleConnectioner is any transport allowing one
@@ -252,22 +118,12 @@ type HTTPTransportDialer interface {
 // underlying transport. In turn, the HTTPTransactioner
 // will use an http.Transport instance.
 //
-// Because we're using HTTPTransactioner, you will
-// see callbacks for the body called when your code
-// is calling RoundTrip. This happens because we
-// pre-read the response body inside HTTPTransactioner.
-//
 // The underlying transport is created the first
 // time you issue an HTTP request.
 //
 // You MUST NOT modify any field of HTTPStandardtransport after
 // construction because this MAY result in a data race.
 type HTTPStandardTransport struct {
-	// MaxBodySize is the maximum body size. Any body larger than
-	// this will cause the RoundTrip to return an error. If zero
-	// or negative, then we'll use a reasonably large default.
-	MaxBodySize int64
-
 	// NewDialer is an optional factory for constructing the dialer to be
 	// used by the transport. This function is called AT MOST
 	// once over the lifecycle of HTTPStandardTransport. If not
@@ -275,6 +131,11 @@ type HTTPStandardTransport struct {
 	//
 	// If you are creating a custom Dialer, you SHOULD set
 	// the expected ALPN to be equal to HTTPSALPN.
+	//
+	// Also, a custom Dialer should have timeouts set for the
+	// read and write operations, so we avoid stuck connections
+	// in censored networks that inject that otherwise may
+	// cause the same connections to stuck forever.
 	//
 	// If this factory is not set, then we use a default factory.
 	NewDialer func() HTTPTransportDialer
@@ -298,7 +159,6 @@ func (t *HTTPStandardTransport) RoundTrip(req *http.Request) (*http.Response, er
 	t.mu.Lock() // no races
 	if t.tw == nil {
 		t.tw = &HTTPTransactioner{
-			MaxBodySize:  t.MaxBodySize,
 			RoundTripper: t.newTransport(t.newDialer()),
 		}
 	}
@@ -325,8 +185,16 @@ func (t *HTTPStandardTransport) newDialer() HTTPTransportDialer {
 	if t.NewDialer != nil {
 		return t.NewDialer()
 	}
-	// make sure we use the expected ALPN value
-	return &Dialer{ALPN: HTTPSALPN}
+	// Make sure we use the expected ALPN value. Also set a
+	// timeout so connections are not stuck in cases where
+	// packet injection otherwise totally stucks them.
+	return &Dialer{
+		ALPN: HTTPSALPN,
+		TCPConnector: &TCPConnector{
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 30 * time.Second,
+		},
+	}
 }
 
 // CloseIdleConnections closes the idle connections.
@@ -355,22 +223,12 @@ type HTTP3TransportDialer interface {
 // underlying transport. In turn, the HTTPTransactioner
 // will use an http3.Transport instance.
 //
-// Because we're using HTTPTransactioner, you will
-// see callbacks for the body called when your code
-// is calling RoundTrip. This happens because we
-// pre-read the response body inside HTTPTransactioner.
-//
 // The underlying transport is created the first
 // time you issue an HTTP request.
 //
 // You MUST NOT modify any field of HTTP3Standardtransport after
 // construction because this MAY result in a data race.
 type HTTP3StandardTransport struct {
-	// MaxBodySize is the maximum body size. Any body larger than
-	// this will cause the RoundTrip to return an error. If zero
-	// or negative, then we'll use a reasonably large default.
-	MaxBodySize int64
-
 	// NewDialer is the optional factory for constructing the dialer to be
 	// used by the transport. This function is called once
 	// for every connection that we setup. This happens because
@@ -398,7 +256,6 @@ func (t *HTTP3StandardTransport) RoundTrip(req *http.Request) (*http.Response, e
 	t.mu.Lock() // no races
 	if t.tw == nil {
 		t.tw = &HTTPTransactioner{
-			MaxBodySize:  t.MaxBodySize,
 			RoundTripper: t.newTransport(),
 		}
 	}
@@ -414,6 +271,10 @@ func (t *HTTP3StandardTransport) newTransport() *http3.RoundTripper {
 	return &http3.RoundTripper{
 		Dial: func(ctx context.Context, network, address string,
 			tlsConf *tls.Config, quicConf *quic.Config) (quic.EarlySession, error) {
+			// Note that the default configuration for QUIC sets a
+			// an idle timeout of 30 seconds so we know that we will
+			// eventually see the connections become unstuck also
+			// in case there's heavy interference.
 			dialer := t.newDialer(tlsConf, quicConf)
 			return dialer.DialQUIC(ctx, address)
 		},
@@ -453,11 +314,6 @@ var HTTP3DefaultClient = &http.Client{Transport: &HTTP3StandardTransport{}}
 // underlying transport. In turn, the HTTPTransactioner
 // will use an http.Transport instance.
 //
-// Because we're using HTTPTransactioner, you will
-// see callbacks for the body called when your code
-// is calling RoundTrip. This happens because we
-// pre-read the response body inside HTTPTransactioner.
-//
 // The underlying transport is created the first
 // time you issue an HTTP request.
 //
@@ -469,11 +325,6 @@ var HTTP3DefaultClient = &http.Client{Transport: &HTTP3StandardTransport{}}
 // HTTP2 servers. This occurs due to instrinsic limitations
 // in the refraction-networking/utls parrot library.
 type HTTP2ParrotTransport struct {
-	// MaxBodySize is the maximum body size. Any body larger than
-	// this will cause the RoundTrip to return an error. If zero
-	// or negative, then we'll use a reasonably large default.
-	MaxBodySize int64
-
 	// NewDialer is an optional factory for constructing the dialer to be
 	// used by the transport. This function is called AT MOST
 	// once over the lifecycle of HTTPStandardTransport. If not
@@ -482,6 +333,10 @@ type HTTP2ParrotTransport struct {
 	// If you are creating a custom Dialer, you SHOULD set
 	// the expected ALPN to be equal to HTTPSALPN. You SHOULD
 	// also configure the proper parroting handshaker.
+	//
+	// Also, remember to set timeouts for connections when
+	// using a default dialer, because we've seen cases
+	// where they were totally stuck in censored networks.
 	//
 	// If this factory is not set, then we use a default factory.
 	NewDialer func() HTTPTransportDialer
@@ -514,7 +369,6 @@ func (t *HTTP2ParrotTransport) RoundTrip(req *http.Request) (*http.Response, err
 	t.mu.Lock() // no races
 	if t.tw == nil {
 		t.tw = &HTTPTransactioner{
-			MaxBodySize:  t.MaxBodySize,
 			RoundTripper: t.newTransport(),
 		}
 	}
@@ -560,8 +414,15 @@ func (t *HTTP2ParrotTransport) newDialer() HTTPTransportDialer {
 	// configure the parroting TLS library. (The ALPN we use
 	// does not matter much probably, since it should be
 	// overwritten by the parrot library.)
+	//
+	// Make also sure we have some timeout just in case
+	// packet inject stucks our conns.
 	return &Dialer{
 		ALPN: HTTPSALPN,
+		TCPConnector: &TCPConnector{
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 30 * time.Second,
+		},
 		TLSHandshaker: &TLSHandshaker{
 			Library: &TLSParrotLibrary{},
 		},
@@ -679,3 +540,62 @@ func (t *HTTP2ParrotTransport) connCacheCleanup() {
 // servers when some TLS features that they advertise are
 // not supported by the parroting library.
 var HTTP2DefaultParrotClient = &http.Client{Transport: &HTTP2ParrotTransport{}}
+
+// ErrHTTPBodyTruncated indicates that the body is truncated.
+var ErrHTTPBodyTruncated = errors.New("oonet: HTTP body was truncated")
+
+// HTTPBodyReadAll reads the whole body in a
+// background goroutine. This function will return
+// earlier if the context is cancelled. In which case
+// we will continue reading the body from a background
+// goroutine, and we will discard the result.
+//
+// The maximum acceptable body size is controlled
+// using the limit argument. If we read more
+// than the specified number of bytes, then we
+// will return ErrHTTPBodyTruncated. If limit
+// is zero or negative we'll use a default value
+// for the maximum body size.
+//
+// The expectEOF argument indicates whether we
+// except the body to terminate by EOF. This
+// should copied from the response.Close
+// argument. If we expect EOF, then we'll
+// tolerate io.EOF when reading.
+//
+// All the code that reads HTTP response bodies
+// in OONI SHOULD be using this facility. We have
+// seen censored networks where not doing this
+// causes the probe to block forever.
+func HTTPBodyReadAll(ctx context.Context,
+	body io.Reader, limit int64, expectEOF bool) ([]byte, error) {
+	datach, errch := make(chan []byte, 1), make(chan error, 1) // buffers
+	const maxBodySize = 1 << 20
+	if limit <= 0 {
+		limit = maxBodySize
+	}
+	go func(body io.Reader, limit int64) {
+		r := io.LimitReader(body, limit)
+		data, err := ioutil.ReadAll(r)
+		if expectEOF && errors.Is(err, io.EOF) {
+			err = nil // we expected EOF so it's not an error
+		}
+		if err != nil {
+			errch <- err
+			return
+		}
+		if int64(len(data)) >= limit {
+			errch <- ErrHTTPBodyTruncated
+			return
+		}
+		datach <- data
+	}(body, limit)
+	select {
+	case data := <-datach:
+		return data, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case err := <-errch:
+		return nil, err
+	}
+}

@@ -12,7 +12,7 @@ import (
 
 func main() {
 	log.SetLevel(log.DebugLevel)
-	timeout := flag.Duration("timeout", 4*time.Second, "DNS timeout")
+	timeout := flag.Duration("timeout", 15*time.Second, "DNS timeout")
 	addr := flag.String("addr", "", "DoT server address")
 	domain := flag.String("domain", "example.com", "Domain to resolve")
 	flag.Parse()
@@ -22,9 +22,7 @@ func main() {
 	monitor := &oonet.LogMonitor{}
 	ctx := oonet.WithMonitor(context.Background(), monitor) // tracing: ON
 	resolver := &oonet.DNSResolver{
-		UnderlyingResolver: &oonet.DNSOverTLSResolver{
-			Address: *addr,
-		},
+		Transport: oonet.NewDNSOverTLSTransport(*addr),
 	}
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
@@ -35,4 +33,6 @@ func main() {
 	for _, addr := range addrs {
 		log.Infof("- %s", addr)
 	}
+	resolver.CloseIdleConnections()
+	time.Sleep(1 * time.Second)
 }

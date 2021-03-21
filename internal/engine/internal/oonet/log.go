@@ -41,17 +41,21 @@ func (m *LogMonitor) OnDNSLookupHostStart(hostname string) {
 
 // OnDNSLookupHostDone is called after a LookupHost operation.
 func (m *LogMonitor) OnDNSLookupHostDone(hostname string, addrs []string, err error) {
-	m.logger().Debugf("dnsLookupHost %s... %+v %+v", hostname, addrs, err)
+	if err != nil {
+		m.logger().Debugf("dnsLookupHost %s... %s", hostname, err.Error())
+		return
+	}
+	m.logger().Debugf("dnsLookupHost %s... %+v", hostname, addrs)
 }
 
 // OnDNSSendQuery is called when we are sending a query.
-func (m *LogMonitor) OnDNSSendQuery(query string) {
-	m.logger().Debugf("dnsQuery:\n%s", query)
+func (m *LogMonitor) OnDNSSendQuery(query *DNSQuery) {
+	m.logger().Debugf("dnsQuery:\n%s", query.Msg.String())
 }
 
 // OnDNSRecvReply is called after we received a reply.
-func (m *LogMonitor) OnDNSRecvReply(reply string) {
-	m.logger().Debugf("dnsReply:\n%s", reply)
+func (m *LogMonitor) OnDNSRecvReply(reply *DNSReply) {
+	m.logger().Debugf("dnsReply:\n%s", reply.Msg.String())
 }
 
 // OnHTTPRoundTripStart is called when we start a round trip.
@@ -81,34 +85,35 @@ func (m *LogMonitor) OnHTTPRoundTripDone(
 	m.logger().Debug("<")
 }
 
-// OnHTTPResponseBodyStart is called when we start reading the body.
-func (m *LogMonitor) OnHTTPResponseBodyStart(resp *http.Response) {
-	m.logger().Debug("reading response body...")
-}
-
-// OnHTTPResponseBodyDone is called when we're done reading the body.
-func (m *LogMonitor) OnHTTPResponseBodyDone(
-	resp *http.Response, data []byte, err error) {
-	m.logger().Debugf("reading response body... <%d bytes> %+v", len(data), err)
-}
-
 // OnConnConnect is called after a socket connect.
 func (m *LogMonitor) OnConnConnect(
 	address string, conn net.Conn, elapsed time.Duration, err error) {
-	m.logger().Debugf("connect %s... %+v %s %+v", address,
-		conn.RemoteAddr(), elapsed, err)
+	if err != nil {
+		m.logger().Debugf("connect %s... %s %s", address, elapsed, err.Error())
+		return
+	}
+	m.logger().Debugf("connect %s... %+v %s", address,
+		conn.RemoteAddr(), elapsed)
 }
 
 // OnConnRead is called after a socket read.
 func (m *LogMonitor) OnConnRead(conn net.Conn, data []byte, err error) {
-	m.logger().Debugf("read %+v... <%d bytes> %+v",
-		conn.RemoteAddr(), len(data), err)
+	if err != nil {
+		m.logger().Debugf("read %+v... %s", conn.RemoteAddr(), err.Error())
+		return
+	}
+	m.logger().Debugf("read %+v... <%d bytes>",
+		conn.RemoteAddr(), len(data))
 }
 
 // OnConnWrite is called after a socket write.
 func (m *LogMonitor) OnConnWrite(conn net.Conn, data []byte, err error) {
-	m.logger().Debugf("write %+v... <%d bytes> %+v",
-		conn.RemoteAddr(), len(data), err)
+	if err != nil {
+		m.logger().Debugf("write %+v... %s", conn.RemoteAddr(), err.Error())
+		return
+	}
+	m.logger().Debugf("write %+v... <%d bytes>",
+		conn.RemoteAddr(), len(data))
 }
 
 // OnConnClose is called before a socket close.
@@ -125,28 +130,47 @@ func (m *LogMonitor) OnTLSHandshakeStart(lib string, conn net.Conn, config *tls.
 // OnTLSHandshakeDone is called at the end of the TLS handshake.
 func (m *LogMonitor) OnTLSHandshakeDone(lib string, conn net.Conn, config *tls.Config,
 	state *tls.ConnectionState, err error) {
-	m.logger().Debugf("tlsHandshake [%s] sni=%s alpn=%+v... %+v",
-		lib, config.ServerName, config.NextProtos, err)
+	if err != nil {
+		m.logger().Debugf("tlsHandshake [%s] sni=%s alpn=%+v... %s",
+			lib, config.ServerName, config.NextProtos, err.Error())
+		return
+	}
+	m.logger().Debugf("tlsHandshake [%s] sni=%s alpn=%+v... ok",
+		lib, config.ServerName, config.NextProtos)
 }
 
 // OnDatagramReadFrom is called after a ReadFrom.
 func (m *LogMonitor) OnDatagramReadFrom(
 	conn net.PacketConn, data []byte, addr net.Addr, err error) {
-	m.logger().Debugf("readFrom %+v <%d bytes> %+v %+v",
-		conn.LocalAddr(), len(data), addr, err)
+	if err != nil {
+		m.logger().Debugf("readFrom %+v %s",
+			conn.LocalAddr(), err.Error())
+		return
+	}
+	m.logger().Debugf("readFrom %+v <%d bytes> %+v",
+		conn.LocalAddr(), len(data), addr)
 }
 
 // OnDatagramWriteTo is called after a WriteTo.
 func (m *LogMonitor) OnDatagramWriteTo(
 	conn net.PacketConn, data []byte, addr net.Addr, err error) {
-	m.logger().Debugf("writeTo %+v <%d bytes> %+v %+v", conn.LocalAddr(),
-		len(data), addr, err)
+	if err != nil {
+		m.logger().Debugf("writeTo %+v %+v %s",
+			conn.LocalAddr(), addr, err.Error())
+		return
+	}
+	m.logger().Debugf("writeTo %+v %+v <%d bytes> %+v", conn.LocalAddr(),
+		addr, len(data), addr)
 }
 
 // OnDatagramListen is called after a UDP listen.
 func (m *LogMonitor) OnDatagramListen(
 	laddr *net.UDPAddr, conn net.PacketConn, err error) {
-	m.logger().Debugf("listen %+v %+v", conn.LocalAddr(), err)
+	if err != nil {
+		m.logger().Debugf("listen %+v %s", laddr, err.Error())
+		return
+	}
+	m.logger().Debugf("listen %+v ok", laddr)
 }
 
 // OnDatagramClose is called before closing the UDP connection.
@@ -165,6 +189,11 @@ func (m *LogMonitor) OnQUICHandshakeStart(
 func (m *LogMonitor) OnQUICHandshakeDone(
 	address string, tlsConf *tls.Config, quicConf *quic.Config,
 	elapsed time.Duration, sess quic.EarlySession, err error) {
-	m.logger().Debugf("quicHandshake sni=%s alpn=%+v... %+v",
-		tlsConf.ServerName, tlsConf.NextProtos, err)
+	if err != nil {
+		m.logger().Debugf("quicHandshake sni=%s alpn=%+v... %s",
+			tlsConf.ServerName, tlsConf.NextProtos, err.Error())
+		return
+	}
+	m.logger().Debugf("quicHandshake sni=%s alpn=%+v... ok",
+		tlsConf.ServerName, tlsConf.NextProtos)
 }

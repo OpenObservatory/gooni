@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"net"
 	"net/http"
@@ -15,6 +14,34 @@ import (
 
 	"github.com/miekg/dns"
 )
+
+// DNSQuery is a query we want to send. When this struct is passed
+// to DNSMonitor.OnDNSSendQuery, all its fields will be initialized
+// (i.e. they will not be nil).
+type DNSQuery struct {
+	// Msg is the message from which we serialized the query.
+	Msg *dns.Msg
+
+	// Type is the query type.
+	Type uint16
+
+	// Raw contains the serialized query.
+	Raw []byte
+}
+
+// DNSReply is a reply we just received. When this struct is passed
+// to DNSMonitor.OnDNSRecvReply, all the fiels will be initialized
+// (i.e. they will not be nil).
+type DNSReply struct {
+	// Msg is the message we have parsed.
+	Msg *dns.Msg
+
+	// Query is the original query.
+	Query *DNSQuery
+
+	// Raw is the payload from which we parsed msg.
+	Raw []byte
+}
 
 // DNSMonitor monitors DNS lookups. The callbacks MUST NOT
 // modify any of their arguments.
@@ -29,37 +56,58 @@ type DNSMonitor interface {
 
 	// OnDNSSendQuery is called before sending a query. The argument
 	// is a serialized user friendly version of the query.
-	OnDNSSendQuery(query string)
+	OnDNSSendQuery(query *DNSQuery)
 
 	// OnDNSRecvReply is called when we receive a well formed
 	// reply. The argument is a serialized user friendly version
 	// of the reply.
-	OnDNSRecvReply(reply string)
+	OnDNSRecvReply(reply *DNSReply)
 }
 
-// DNSUnderlyingResolver is the underlying resolver
-// used by an instance of DNSResolver.
-type DNSUnderlyingResolver interface {
-	// LookupHost should behave like net.Resolver.LookupHost.
-	LookupHost(ctx context.Context, hostname string) ([]string, error)
+// DNSTransport is a DNS transport. The job of a transport
+// is to send a query (as a bag of bytes) and implement the
+// proper protocol (e.g. DoH) to read the bytes that will
+// possibly correspond to a DNS reply.
+//
+// If a DNSTransport is not able to deal with concurrent
+// DNS round trips, then is should use locking to prevent
+// more than one concurrent round trip at a time.
+//
+// Implementations of DNSTransport SHOULD honour the
+// context and return immediately when it has been cancelled.
+type DNSTransport interface {
+	// RoundTrip performs the DNS round trip.
+	RoundTrip(ctx context.Context, query *DNSQuery,
+		codec DNSCodec) (*DNSReply, error)
+
+	// Padding returns true if we need padding.
+	Padding() bool
+
+	// CloseIdleConnections closes idle connections.
+	CloseIdleConnections()
 }
 
 // DNSResolver is the DNS resolver. Its main job is to emit
 // events and to ensure returned errors are wrapped.
 //
-// The real DNS resolution work is demanded to an underlying
-// resolver. The DNSResolver will not own the underlying resolver
-// and will not attempt to reclaim unused connections that the
-// underlying resolver MAY be keeping alive. It is your job
-// to ensure that you are closing such connections when needed.
+// The DNSResolver takes an optional DNSTransport. If the
+// DNSTransport is nil, we use the net.Resolver. Otherwise,
+// we will send the queries over using the DNSTransport
+// and return to you the replies we received.
+//
+// The DNSResolver's CloseIdleConnections method allows
+// closing idle connections in the DNSTransport.
 //
 // You MUST NOT modify any field of Resolver after construction
 // because this MAY result in a data race.
 type DNSResolver struct {
-	// UnderlyingResolver is the optional DNSUnderlyingResolver
-	// to use. If not set, we use net.Resolver. If you want, e.g.,
-	// a DoH resolver, then you should override this field.
-	UnderlyingResolver DNSUnderlyingResolver
+	// Transport is the optional DNSTransport. If not
+	// set will will use the stdlib.
+	Transport DNSTransport
+
+	// Codec is the optional DNSCodec. If not set then
+	// we will use the default DNS codec.
+	Codec DNSCodec
 }
 
 // ErrLookupHost is an error occurring during a LookupHost operation.
@@ -72,12 +120,25 @@ func (e *ErrLookupHost) Unwrap() error {
 	return e.error
 }
 
-// LookupHost maps a hostname to a list of IP addresses.
+// CloseIdleConnections closes idle connections
+// in the underlying DNSTransport. If there's no
+// DNSTransport, this function is a no-op.
+func (r *DNSResolver) CloseIdleConnections() {
+	if r.Transport != nil {
+		r.Transport.CloseIdleConnections()
+	}
+}
+
+// LookupHost maps a hostname to a list of IP addresses. If the
+// input hostname is an IP address, then this function will return
+// immediately WITHOUT emitting any DNS events.
 func (r *DNSResolver) LookupHost(
 	ctx context.Context, hostname string) ([]string, error) {
+	if net.ParseIP(hostname) != nil {
+		return []string{hostname}, nil
+	}
 	ContextMonitor(ctx).OnDNSLookupHostStart(hostname)
-	ures := r.underlyingResolver()
-	addrs, err := ures.LookupHost(ctx, hostname)
+	addrs, err := r.doLookupHost(ctx, hostname)
 	if err != nil {
 		err = &ErrLookupHost{err}
 	}
@@ -85,12 +146,14 @@ func (r *DNSResolver) LookupHost(
 	return addrs, err
 }
 
-// underlyingResolver returns the DNSUnderlyingResolver to use.
-func (r *DNSResolver) underlyingResolver() DNSUnderlyingResolver {
-	if r.UnderlyingResolver != nil {
-		return r.UnderlyingResolver
+// doLookupHost uses the underlying transport, if any, and
+// otherwise falls back to the system resolver.
+func (r *DNSResolver) doLookupHost(
+	ctx context.Context, hostname string) ([]string, error) {
+	if r.Transport != nil {
+		return r.lookupHostWithTransport(ctx, hostname)
 	}
-	return &net.Resolver{}
+	return (&net.Resolver{}).LookupHost(ctx, hostname)
 }
 
 // DNSCodec encodes and decodes DNS messages. In addition to
@@ -98,27 +161,25 @@ func (r *DNSResolver) underlyingResolver() DNSUnderlyingResolver {
 // emit an event every time we successfully marshal a query
 // and every time we successfully unmarshal a reply.
 type DNSCodec interface {
-	// EncodeLookupHostRequest encodes a LookupHost request.
-	EncodeLookupHostRequest(ctx context.Context,
-		domain string, qtype uint16, padding bool) ([]byte, error)
+	// EncodeLookupHostQuery encodes a LookupHost query.
+	EncodeLookupHostQuery(
+		domain string, qtype uint16, padding bool) (*DNSQuery, error)
 
-	// DecodeLookupHostResponse decodes a LookupHost response.
-	DecodeLookupHostResponse(ctx context.Context,
-		qtype uint16, data []byte) ([]string, error)
+	// DecodeReply decodes a DNS reply.
+	DecodeReply(data []byte) (*dns.Msg, error)
 }
 
 // dnsMiekgCodec is a DNSCodec using miekg/dns. This is the
 // codec used by default by this library.
 type dnsMiekgCodec struct{}
 
-// EncodeLookupHostRequest implements DNSCodec.EncodeLookupHostRequest.
-func (c *dnsMiekgCodec) EncodeLookupHostRequest(
-	ctx context.Context, domain string,
-	qtype uint16, padding bool) ([]byte, error) {
+// EncodeLookupHostQuery implements DNSCodec.EncodeLookupHostQuery.
+func (c *dnsMiekgCodec) EncodeLookupHostQuery(domain string,
+	qtype uint16, padding bool) (*DNSQuery, error) {
 	const (
-		// desiredBlockSize is the size that the padded
+		// blockSize is the size that the padded
 		// query should be multiple of
-		desiredBlockSize = 128
+		blockSize = 128
 		// EDNS0MaxResponseSize is the maximum response size for EDNS0
 		EDNS0MaxResponseSize = 4096
 		// DNSSECEnabled turns on support for DNSSEC when using EDNS0
@@ -140,15 +201,19 @@ func (c *dnsMiekgCodec) EncodeLookupHostRequest(
 		// 128 octets RFC8467#section-4.1. We inflate the query
 		// length by the size of the option (i.e. 4 octets). The
 		// cast to uint is necessary to make the modulus operation
-		// work as intended when the desiredBlockSize is smaller
+		// work as intended when the desired block size's smaller
 		// than (query.Len()+4) ¯\_(ツ)_/¯.
-		remainder := (desiredBlockSize - uint(query.Len()+4)) % desiredBlockSize
+		remainder := (blockSize - uint(query.Len()+4)) % blockSize
 		opt := new(dns.EDNS0_PADDING)
 		opt.Padding = make([]byte, remainder)
 		query.IsEdns0().Option = append(query.IsEdns0().Option, opt)
 	}
-	ContextMonitor(ctx).OnDNSSendQuery(query.String())
-	return query.Pack()
+	raw, err := query.Pack()
+	if err != nil {
+		return nil, err
+	}
+	out := &DNSQuery{Msg: query, Type: qtype, Raw: raw}
+	return out, nil
 }
 
 // Implementation note: the following errors try to match
@@ -178,27 +243,35 @@ var ErrDNSServerTemporarilyMisbehaving = errors.New("server misbehaving")
 // understand what error was returned by the server.
 var ErrDNSServerMisbehaving = errors.New("server misbehaving")
 
-// DecodeLookupHostResponse implements DNSCodec.DecodeLookupHostResponse.
-func (c *dnsMiekgCodec) DecodeLookupHostResponse(
-	ctx context.Context, qtype uint16, data []byte) ([]string, error) {
+// DecodeReply implements DNSCodec.DecodeReply.
+func (c *dnsMiekgCodec) DecodeReply(data []byte) (*dns.Msg, error) {
 	reply := new(dns.Msg)
 	if err := reply.Unpack(data); err != nil {
 		return nil, err
 	}
-	ContextMonitor(ctx).OnDNSRecvReply(reply.String())
-	switch reply.Rcode {
+	return reply, nil
+}
+
+// RcodeToError converts the reply Rcode to the proper DNS error.
+func (r *DNSReply) RcodeToError() error {
+	switch r.Msg.Rcode {
 	case dns.RcodeNameError:
-		return nil, ErrDNSNoSuchHost
+		return ErrDNSNoSuchHost
 	case dns.RcodeServerFailure:
-		return nil, ErrDNSServerTemporarilyMisbehaving
+		return ErrDNSServerTemporarilyMisbehaving
 	case dns.RcodeSuccess:
-		// fallthrough
+		return nil
 	default:
-		return nil, ErrDNSServerMisbehaving
+		return ErrDNSServerMisbehaving
 	}
+}
+
+// AnswerToLookupHostResult converts the answer into
+// the result expected by LookupHost.
+func (r *DNSReply) AnswerToLookupHostResult() ([]string, error) {
 	var addrs []string
-	for _, answer := range reply.Answer {
-		switch qtype {
+	for _, answer := range r.Msg.Answer {
+		switch r.Query.Type {
 		case dns.TypeA:
 			if rra, ok := answer.(*dns.A); ok {
 				ip := rra.A
@@ -215,175 +288,6 @@ func (c *dnsMiekgCodec) DecodeLookupHostResponse(
 		return nil, ErrDNSNoAsnwerFromDNSServer
 	}
 	return addrs, nil
-}
-
-// DNSOverHTTPSHTTPClient is the HTTP client to use. The standard
-// library http.DefaultHTTPClient matches this interface.
-type DNSOverHTTPSHTTPClient interface {
-	// Do should behave like http.Client.Do.
-	Do(req *http.Request) (*http.Response, error)
-}
-
-// DNSOverHTTPSResolver is a DNS over HTTPS resolver. You MUST NOT
-// modify any field of this struct once you've initialized it because
-// that MAY likely lead to data races.
-//
-// DNSOverHTTPSResolver WILL NOT wrap returned errors using, e.g.,
-// ErrLookupHost because this is the DNSResolver's job.
-//
-// The DNSOverHTTPSResolver references an underlying HTTP client,
-// however, it DOES NOT OWN such a client. Therefore, it won't
-// attempt to reclaim any unused connections in such a client. It
-// is your responsibility to do that when needed.
-//
-// This resolver will perform the DNS round trip (sending a query
-// and receiving a reply) in a background goroutine. If the context
-// expires before that operation is complete, this resolver will
-// leak such a goroutine and return early. A well behaved HTTP client
-// should be configured such that any I/O operation will eventually
-// timeout. So, if you are using a well behaved HTTP client with
-// this resolver, then goroutine leak will be temporary.
-type DNSOverHTTPSResolver struct {
-	// Client is the optional HTTP client to use. If not set,
-	// then we will use HTTPXDefaultClient.
-	Client DNSOverHTTPSHTTPClient
-
-	// Codec is the DNSCodec to use. If not set, then
-	// we will use a suitable default DNSCodec.
-	Codec DNSCodec
-
-	// URL is the mandatory URL of the server. If not set,
-	// then this code will certainly fail.
-	URL string
-
-	// UserAgent is the optional User-Agent header to use. If not
-	// set, Golang's standard user agent is used.
-	UserAgent string
-}
-
-// LookupHost implements DNSUnderlyingResolver.LookupHost. This
-// function WILL NOT wrap the returned error. We assume that
-// this job is performed by DNSResolver, which should be used
-// as a wrapper type for this type.
-func (r *DNSOverHTTPSResolver) LookupHost(
-	ctx context.Context, hostname string) ([]string, error) {
-	return (&dnsGenericResolver{
-		codec:   r.codec(),
-		padding: true,
-		t:       r,
-	}).LookupHost(ctx, hostname)
-}
-
-// codec returns the DNSCodec to use.
-func (r *DNSOverHTTPSResolver) codec() DNSCodec {
-	if r.Codec != nil {
-		return r.Codec
-	}
-	return &dnsMiekgCodec{}
-}
-
-// dnsOverHTTPSResult is the result of running the DNS
-// round trip in a background goroutine.
-type dnsOverHTTPSResult struct {
-	// data is the data in the response body.
-	data []byte
-
-	// err is the error that occurred.
-	err error
-}
-
-// roundTrip implements dnsTransport.roundTrip. This function
-// will read the body in a background goroutine such that we're
-// able to immediately react to the context being cancelled.
-func (r *DNSOverHTTPSResolver) roundTrip(
-	ctx context.Context, query []byte) ([]byte, error) {
-	req, err := http.NewRequestWithContext(
-		ctx, "POST", r.URL, bytes.NewReader(query))
-	if err != nil {
-		return nil, err
-	}
-	if r.UserAgent != "" {
-		req.Header.Set("user-agent", r.UserAgent)
-	}
-	req.Header.Set("content-type", "application/dns-message")
-	var resp *http.Response
-	resp, err = r.client().Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, ErrDNSServerTemporarilyMisbehaving
-	}
-	if resp.Header.Get("content-type") != "application/dns-message" {
-		return nil, ErrDNSServerTemporarilyMisbehaving
-	}
-	ch := make(chan *dnsOverHTTPSResult, 1) // buffer
-	const maxBodySize = 1 << 20
-	go r.readyBodyAsync(resp.Body, maxBodySize, ch)
-	select {
-	case out := <-ch:
-		return out.data, out.err
-	case <-ctx.Done():
-		return nil, ctx.Err() // the context won the race
-	}
-}
-
-// readyBodyAsync is a background goroutine that reads the body
-// and posts the result on the provided channel.
-func (r *DNSOverHTTPSResolver) readyBodyAsync(body io.Reader,
-	limit int64, ch chan<- *dnsOverHTTPSResult) {
-	body = io.LimitReader(body, limit)
-	data, err := ioutil.ReadAll(body)
-	ch <- &dnsOverHTTPSResult{data: data, err: err}
-}
-
-// client returns the DNSOverHTTPSClient to use.
-func (r *DNSOverHTTPSResolver) client() DNSOverHTTPSHTTPClient {
-	if r.Client != nil {
-		return r.Client
-	}
-	return HTTPXDefaultClient
-}
-
-// dnsTransport is a DNS transport. The job of a transport
-// is to send a query (as a bag of bytes) and implement the
-// proper protocol (e.g. DoH) to read the bytes that will
-// possibly correspond to a DNS reply.
-//
-// If a dnsTransport is not able to deal with concurrent
-// DNS round trips, then is should use locking to prevent
-// more than one concurrent round trip at a time.
-//
-// Implementations of dnsTransport SHOULD honour the
-// context and return immediately when it has been cancelled.
-type dnsTransport interface {
-	// roundTrip performs the DNS round trip.
-	roundTrip(ctx context.Context, data []byte) ([]byte, error)
-}
-
-// dnsGenericResolver is a generic resolver. The job of this
-// structure is to generate queries to send, send them via the
-// configured transport, and parse the resulting bytes that
-// are returned by the transport.
-//
-// The dnsGenericResolver MAY issue queries in parallel. A well
-// behaved transport SHOULD use locking if it's not able to deal
-// correctly with queries running in parallel.
-//
-// This type assumes that the transport is able to immediately
-// react to a cancelled context, therefore it DOESN'T check
-// whether the context has been terminated while queries are
-// still pending. That's the transport job, not ours.
-type dnsGenericResolver struct {
-	// codec is the mandatory DNSCodec.
-	codec DNSCodec
-
-	// padding indicates whether we want padding.
-	padding bool
-
-	// t is the mandatory transport.
-	t dnsTransport
 }
 
 // dnsLookupHostResult is the result of a lookupHost operation.
@@ -412,18 +316,21 @@ func (e *ErrDNSQuery) Error() string {
 		e.ErrA.Error(), e.ErrAAAA.Error())
 }
 
-// LookupHost performs a LookupHost operation.
-func (r *dnsGenericResolver) LookupHost(
+// lookupHostWithTransport performs a LookupHost operation
+// using the configured DNSTransport.
+func (r *DNSResolver) lookupHostWithTransport(
 	ctx context.Context, hostname string) ([]string, error) {
 	resA, resAAAA := make(chan *dnsLookupHostResult), make(chan *dnsLookupHostResult)
-	go r.asyncLookupHost(ctx, hostname, dns.TypeA, r.padding, resA)
+	go r.runLookupHostWithTransport(
+		ctx, hostname, dns.TypeA, r.Transport.Padding(), resA)
 	// Implementation note: we can make this parallel very easily and it will
 	// also be significantly more difficult to debug because the events in the
 	// monitor will overlap while the two requests are in progress.
 	// Also note that we don't honour the context because it's the job
 	// of the transport to react to context cancellation.
 	replyA := <-resA
-	go r.asyncLookupHost(ctx, hostname, dns.TypeAAAA, r.padding, resAAAA)
+	go r.runLookupHostWithTransport(
+		ctx, hostname, dns.TypeAAAA, r.Transport.Padding(), resAAAA)
 	replyAAAA := <-resAAAA
 	if replyA.err != nil && replyAAAA.err != nil {
 		err := &ErrDNSQuery{ErrA: replyA.err, ErrAAAA: replyAAAA.err}
@@ -440,40 +347,175 @@ func (r *dnsGenericResolver) LookupHost(
 	return addrs, nil
 }
 
-// asyncLookupHost is the goroutine that performs a lookupHost.
-func (r *dnsGenericResolver) asyncLookupHost(
+// runLookupHostWithTransport is the goroutine that performs the
+// lookup host operation using the configured transport.
+func (r *DNSResolver) runLookupHostWithTransport(
 	ctx context.Context, hostname string, qtype uint16, padding bool,
 	resch chan<- *dnsLookupHostResult) {
-	addrs, err := r.doLookupHost(ctx, hostname, qtype, padding)
+	query, err := r.codec().EncodeLookupHostQuery(hostname, qtype, padding)
+	if err != nil {
+		resch <- &dnsLookupHostResult{err: err}
+		return
+	}
+	ContextMonitor(ctx).OnDNSSendQuery(query)
+	reply, err := r.Transport.RoundTrip(ctx, query, r.codec())
+	if err != nil {
+		resch <- &dnsLookupHostResult{err: err}
+		return
+	}
+	ContextMonitor(ctx).OnDNSRecvReply(reply)
+	if err := reply.RcodeToError(); err != nil {
+		resch <- &dnsLookupHostResult{err: err}
+		return
+	}
+	addrs, err := reply.AnswerToLookupHostResult()
 	resch <- &dnsLookupHostResult{addrs: addrs, err: err}
 }
 
-// doLookupHost performs a lookupHost operation.
-func (r *dnsGenericResolver) doLookupHost(
-	ctx context.Context, hostname string, qtype uint16,
-	padding bool) ([]string, error) {
-	query, err := r.codec.EncodeLookupHostRequest(ctx, hostname, qtype, padding)
+// codec returns the DNSCodec to use.
+func (r *DNSResolver) codec() DNSCodec {
+	if r.Codec != nil {
+		return r.Codec
+	}
+	return &dnsMiekgCodec{}
+}
+
+// DNSOverHTTPSHTTPClient is the HTTP client to use. The standard
+// library http.DefaultHTTPClient matches this interface.
+type DNSOverHTTPSHTTPClient interface {
+	// Do should behave like http.Client.Do.
+	Do(req *http.Request) (*http.Response, error)
+
+	// CloseIdleConnections should behave
+	// like http.Client.CloseIdleConnections.
+	CloseIdleConnections()
+}
+
+// DNSOverHTTPSTransport is a DNS over HTTPS transport. You MUST NOT
+// modify any field of this struct once you've initialized it because
+// that MAY likely lead to data races.
+//
+// The DNSOverHTTPSTransport owns the underlying HTTP client and
+// will close its idle connections on CloseIdleConnections.
+//
+// This transport will perform the DNS round trip (sending a query
+// and receiving a reply) in a background goroutine. If the context
+// expires before that operation is complete, this transport will
+// leak such a goroutine and return early. A well behaved HTTP client
+// should be configured such that any I/O operation will eventually
+// timeout. So, if you are using a well behaved HTTP client with
+// this transport, then goroutine leak will be temporary.
+type DNSOverHTTPSTransport struct {
+	// Client is the optional HTTP client to use. If not set,
+	// then we will use DNSOverHTTPSDefaultHTTPClient.
+	Client DNSOverHTTPSHTTPClient
+
+	// URL is the mandatory URL of the server. If not set,
+	// then this code will certainly fail.
+	URL string
+
+	// UserAgent is the optional User-Agent header to use. If not
+	// set, Golang's standard user agent is used.
+	UserAgent string
+}
+
+// CloseIdleConnections implements DNSTransport.CloseIdleConnections.
+func (r *DNSOverHTTPSTransport) CloseIdleConnections() {
+	r.client().CloseIdleConnections()
+}
+
+// Padding implements DNSTransport.Padding.
+func (r *DNSOverHTTPSTransport) Padding() bool {
+	return true
+}
+
+// RoundTrip implements DNSTransport.RoundTrip. This function
+// will read the body in a background goroutine such that we're
+// able to immediately react to the context being cancelled.
+func (r *DNSOverHTTPSTransport) RoundTrip(ctx context.Context,
+	query *DNSQuery, codec DNSCodec) (*DNSReply, error) {
+	req, err := http.NewRequestWithContext(
+		ctx, "POST", r.URL, bytes.NewReader(query.Raw))
 	if err != nil {
 		return nil, err
 	}
-	reply, err := r.t.roundTrip(ctx, query)
+	if r.UserAgent != "" {
+		req.Header.Set("user-agent", r.UserAgent)
+	}
+	req.Header.Set("content-type", "application/dns-message")
+	var resp *http.Response
+	resp, err = r.client().Do(req)
 	if err != nil {
 		return nil, err
 	}
-	return r.codec.DecodeLookupHostResponse(ctx, qtype, reply)
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, ErrDNSServerTemporarilyMisbehaving
+	}
+	if resp.Header.Get("content-type") != "application/dns-message" {
+		return nil, ErrDNSServerTemporarilyMisbehaving
+	}
+	const maxBodySize = 1 << 20
+	data, err := HTTPBodyReadAll(ctx, resp.Body, maxBodySize, resp.Close)
+	if err != nil {
+		return nil, err
+	}
+	replyMsg, err := codec.DecodeReply(data)
+	if err != nil {
+		return nil, err
+	}
+	return &DNSReply{Msg: replyMsg, Query: query, Raw: data}, nil
+}
+
+// DNSOverHTTPSDefaultHTTPClient is the default HTTP
+// client used by DNS over HTTPS.
+var DNSOverHTTPSDefaultHTTPClient = &http.Client{Transport: &HTTPXTransport{}}
+
+// client returns the DNSOverHTTPSClient to use.
+func (r *DNSOverHTTPSTransport) client() DNSOverHTTPSHTTPClient {
+	if r.Client != nil {
+		return r.Client
+	}
+	return DNSOverHTTPSDefaultHTTPClient
+}
+
+// NewDNSOverUDPTransport creates a new DNS-over-UDP DNSTransport
+// using a suitably-configured DNSOverConnTransport.
+func NewDNSOverUDPTransport(address string) *DNSOverConnTransport {
+	return &DNSOverConnTransport{
+		Address: address,
+		Dial:    (&Dialer{}).DialContext,
+		Network: "udp",
+	}
+}
+
+// NewDNSOverTCPTransport creates a new DNS-over-TCP DNSTransport
+// using a suitably-configured DNSOverConnTransport.
+func NewDNSOverTCPTransport(address string) *DNSOverConnTransport {
+	return &DNSOverConnTransport{
+		Address: address,
+		Dial:    (&Dialer{}).DialContext,
+		Network: "tcp",
+	}
+}
+
+// DNSOverTLSALPN is the ALPN used for DNS-over-TLS.
+var DNSOverTLSALPN = []string{"dot"}
+
+// NewDNSOverTLSTransport creates a new DNS-over-TLS DNSTransport
+// using a suitably-configured DNSOverConnTransport.
+func NewDNSOverTLSTransport(address string) *DNSOverConnTransport {
+	return &DNSOverConnTransport{
+		Address: address,
+		Dial:    (&Dialer{ALPN: DNSOverTLSALPN}).DialTLSContext,
+		Network: "tls",
+	}
 }
 
 // dnsStreamer streams DNS queries and destreams replies. The way
 // to do that depends on whether we're using an underlying datagram
 // or stream connection. The main job of implementations of this
-// interface would therefore be to properly stream/destream. Also,
-// an implementation of dnsStreamer MUST handle:
-//
-// 1. the case where the net.Conn is nil, where it should
-// fail by returning errDNSStreamerNilConn;
-//
-// 2. timeouts for the stream.
-//
+// interface would therefore be to properly stream/destream.
 // An implementation of dnsStream MUST only Read or Write the
 // connection and MUST NOT attempt to Close it.
 type dnsStreamer interface {
@@ -490,33 +532,20 @@ type dnsStreamerTCPTLS struct{}
 // errDNSStreamerQueryTooLarge means that the query is too large.
 var errDNSStreamerQueryTooLarge = errors.New("oonet: query too large")
 
-// errDNSStreamerNilConn indicates that the connection is nil.
-var errDNSStreamerNilConn = errors.New("oonet: conn is nil")
-
 // stream implements dnsStreamer.Stream.
 func (s *dnsStreamerTCPTLS) Stream(conn net.Conn, query []byte) error {
-	if conn == nil {
-		return errDNSStreamerNilConn
-	}
 	if len(query) > math.MaxUint16 {
 		return errDNSStreamerQueryTooLarge
 	}
 	buf := []byte{byte(len(query) >> 8)}
 	buf = append(buf, byte(len(query)))
 	buf = append(buf, query...)
-	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	defer conn.SetWriteDeadline(time.Time{})
 	_, err := conn.Write(buf)
 	return err
 }
 
 // Destream implements dnsStreamer.Destream.
 func (s *dnsStreamerTCPTLS) Destream(conn net.Conn) ([]byte, error) {
-	if conn == nil {
-		return nil, errDNSStreamerNilConn
-	}
-	conn.SetReadDeadline(time.Now().Add(4 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return nil, err
@@ -534,24 +563,13 @@ type dnsStreamerUDP struct{}
 
 // Stream implements dnsStreamer.Stream.
 func (s *dnsStreamerUDP) Stream(conn net.Conn, query []byte) error {
-	if conn == nil {
-		return errDNSStreamerNilConn
-	}
-	conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	defer conn.SetWriteDeadline(time.Time{})
 	_, err := conn.Write(query)
 	return err
 }
 
 // Destream implements dnsStreamer.Destream.
 func (s *dnsStreamerUDP) Destream(conn net.Conn) ([]byte, error) {
-	if conn == nil {
-		return nil, errDNSStreamerNilConn
-	}
-	conn.SetReadDeadline(time.Now().Add(4 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
 	reply := make([]byte, 1<<17)
-	var count int
 	count, err := conn.Read(reply)
 	if err != nil {
 		return nil, err
@@ -559,339 +577,318 @@ func (s *dnsStreamerUDP) Destream(conn net.Conn) ([]byte, error) {
 	return reply[:count], nil
 }
 
-// dnsChannel is a communication channel between us
-// and a specific server over a net.Conn.
-//
-// You MUST set the mandatory fields and you MUST NOT
-// modify them after initialization. Other fields will
-// be created when needed by this structure.
-//
-// The dnsChannel will synchronize its roundTrip
-// method so that no concurrent round trips are possible,
-// in complicance with the dnsTransport requirements.
-type dnsChannel struct {
-	// address is the mandatory address of the server.
-	address string
+// dnsOverConnPendingQuery is a pending query for DNSOverConnTransport.
+type dnsOverConnPendingQuery struct {
+	// query is the original query. This field is set
+	// by DNSOverConnTransport.RoundTrip.
+	query *DNSQuery
 
-	// conn is the connection with the server. It will be
-	// created on the first usage.
-	conn net.Conn
+	// reply is the reply. This field is set by the
+	// dnsOverConnWorker before closing done.
+	reply *dns.Msg
 
-	// dial is the mandatory function for dialing connections.
-	dial func(ctx context.Context, network, address string) (net.Conn, error)
+	// rawReply is the raw reply. This field is set by the
+	// dnsOverConnWorker before closing done.
+	rawReply []byte
 
-	// mu provides mutual exclusion.
+	// done is the channel to signal completion. This field
+	// is created by DNSOverConnTransport.RoundTrip and is
+	// closed by dnsOverConnWorker when we have a reply.
+	done chan interface{}
+}
+
+// dnsOverConnState keeps the state of DNSOverConnTransport. The
+// state is shared between DNSOverConnTransport and dnsOverConnWorker.
+type dnsOverConnState struct {
+	// mu provides synchronized access. This field
+	// does not require any initialization.
 	mu sync.Mutex
 
-	// network is the mandatory network of the address.
-	network string
+	// pending contains the pending queries. The user MUST
+	// ensure that this field is initialized before attempting
+	// to store a dnsOverConnPendingQuery into it. If not,
+	// the caller MUST initialize it. Also, any access to this
+	// field MUST be under the protection of the mutex.
+	pending map[uint16]*dnsOverConnPendingQuery
+}
 
-	// streamer is the mandatory DNSStreamer.
+// dnsOverConnWorker runs in a background goroutine and reads
+// incoming DNS replies. Whenever it finds a new reply, the
+// worker will update the shared state. To terminate a worker,
+// call its close method, which will shut it down.
+type dnsOverConnWorker struct {
+	// codec is the DNSCodec to use.
+	codec DNSCodec
+
+	// conn is the connection we're using.
+	conn net.Conn
+
+	// state is the shared state.
+	state *dnsOverConnState
+
+	// streamer is the streamer we should use.
 	streamer dnsStreamer
 }
 
-// roundTrip implements dnsTransport.roundTrip.
-func (c *dnsChannel) roundTrip(ctx context.Context, query []byte) ([]byte, error) {
-	c.mu.Lock() // we run a single round trip at any given time
-	defer c.mu.Unlock()
-	err := c.streamer.Stream(c.conn, query) // a nil c.conn causes an error
-	if err != nil {
-		if c.conn != nil { // c.conn is nil on first usage/after error
-			c.conn.Close()
-			c.conn = nil
-			// try to redial
-		}
-		conn, err := c.dial(ctx, c.network, c.address)
+// reader runs the dnsOverConnWorker read loop.
+func (w *dnsOverConnWorker) reader() {
+	for {
+		rawReply, err := w.streamer.Destream(w.conn)
 		if err != nil {
-			return nil, err
+			w.conn.Close() // possibly redundant and thread safe
+			return
 		}
-		c.conn = conn
-		if err := c.streamer.Stream(c.conn, query); err != nil {
-			c.conn.Close()
-			c.conn = nil
-			return nil, err
+		reply, err := w.codec.DecodeReply(rawReply)
+		if err != nil {
+			continue
 		}
+		w.state.mu.Lock()
+		if pq, found := w.state.pending[reply.Id]; found {
+			// because the RoundTrip may not be waiting anymore, we
+			// need to cleanup the pending state in advance.
+			delete(w.state.pending, reply.Id)
+			pq.reply = reply
+			pq.rawReply = rawReply
+			close(pq.done) // synchronize with the waiter (if any)
+		}
+		w.state.mu.Unlock()
 	}
-	data, err := c.streamer.Destream(c.conn)
+}
+
+// write uses the connection to send a query. This method takes a
+// timeout argument such that we will not know that we cannot really
+// use this worker for sending a query and we need a new worker.
+func (c *dnsOverConnWorker) write(rawQuery []byte, timeout time.Duration) error {
+	c.conn.SetWriteDeadline(time.Now().Add(timeout))
+	defer c.conn.SetWriteDeadline(time.Time{})
+	if err := c.streamer.Stream(c.conn, rawQuery); err != nil {
+		c.conn.Close() // possibly redundant and thread safe
+		return err
+	}
+	return nil
+}
+
+// close closes the underlying connection.
+func (c *dnsOverConnWorker) close() {
+	c.conn.Close() // possibly redundant and thread safe
+}
+
+// DNSOverConnTransport is a transport that operates using
+// TLS, TCP, and UDP connections. It will create a worker
+// running in the background that monitors a connection of
+// the proper type to the selected DNS server.
+//
+// The CloseIdleConnection method allows you to shutdown the
+// background worker if there are no pending queries. The
+// worker will created on demand, when there is no already
+// running worker. There will be AT MOST one worker for
+// each instance of DNSOverConnTransport.
+//
+// After initialization, you MUST NOT change any field of this
+// structure, because this MAY lead to data races.
+type DNSOverConnTransport struct {
+	// Address is the address of the server. You MUST set
+	// this field, otherwise the transport will fail.
+	Address string
+
+	// codec is the optional codec to use. If not set, we
+	// will the default miekg/dns codec.
+	codec DNSCodec
+
+	// Dial is the dialing factory. You MUST set this field
+	// to either a cleartext connection dialer or to a TLS
+	// aware connection dialer. When configuring the dialer
+	// for DoT, make sure you set the ALPN.
+	Dial func(ctx context.Context, network, address string) (net.Conn, error)
+
+	// Network is the network of the server. You MUST set
+	// this field to one of "tls", "tcp", and "udp".
+	Network string
+
+	// mu protects this data structure. This field does
+	// not require any explicit initialization.
+	mu sync.Mutex
+
+	// state is the shared state. This field will be
+	// automatically created on first use.
+	state *dnsOverConnState
+
+	// worker is the background worker. This field will
+	// be created every time it is needed.
+	worker *dnsOverConnWorker
+}
+
+// Padding implements DNSTransport.Padding. We will return that
+// we need padding if and only if Network is equal to "tls".
+func (t *DNSOverConnTransport) Padding() bool {
+	return t.Network == "tls"
+}
+
+// CloseIdleConnections implements DNSTransport.CloseIdleConnections. We
+// will tell the underlying worker to shutdown if and only if there are
+// currently no pending DNS queries. Otherwise, this function is a no-op.
+func (t *DNSOverConnTransport) CloseIdleConnections() {
+	defer t.mu.Unlock()
+	t.mu.Lock()
+	if t.worker != nil && t.state != nil && len(t.state.pending) <= 0 {
+		t.worker.close()
+		t.worker = nil
+	}
+}
+
+// ErrDNSQueryTimeout indicates that a DNS query timed out.
+var ErrDNSQueryTimeout = errors.New("oonet: timeout waiting for DNS reply")
+
+// errNoWorker indicates that we don't have a worker.
+var errNoWorker = errors.New("oonet: worker is not set")
+
+// RoundTrip implements DNSTransport.RoundTrip. This method will
+// start a worker, if necessary. Then it will use the worker to
+// send the query and wait for the reply. If no reply is received
+// within a certain small timeout, this method will return an
+// ErrDNSQueryTimeout to the caller. This method will also fail
+// as soon as the context argument is cancelled or times out.
+func (t *DNSOverConnTransport) RoundTrip(
+	ctx context.Context, query *DNSQuery, codec DNSCodec) (*DNSReply, error) {
+	if err := t.write(ctx, query, codec); err != nil {
+		return nil, err // cannot send query out
+	}
+	pq := &dnsOverConnPendingQuery{
+		query: query,
+		done:  make(chan interface{}, 1), // with buffer!
+	}
+	t.state.mu.Lock()
+	if t.state.pending == nil {
+		t.state.pending = make(map[uint16]*dnsOverConnPendingQuery)
+	}
+	t.state.pending[query.Msg.Id] = pq
+	t.state.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second) // query timeout
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		t.state.mu.Lock()
+		delete(t.state.pending, query.Msg.Id) // cleanup
+		t.state.mu.Unlock()
+		return nil, ctx.Err()
+	case <-pq.done:
+		reply := &DNSReply{
+			Msg:   pq.reply,
+			Query: query,
+			Raw:   pq.rawReply,
+		}
+		return reply, nil
+	}
+}
+
+// write writes the query using the worker. If there is no worker or
+// the current worker is broken, we'll create a new worker.
+func (t *DNSOverConnTransport) write(
+	ctx context.Context, query *DNSQuery, codec DNSCodec) error {
+	t.mu.Lock()
+	if err := t.writeWithCurrentWorkerUnlocked(ctx, query, codec); err == nil {
+		t.mu.Unlock() // unlock and leave
+		return nil
+	}
+	t.mu.Unlock() // unlock because we want to dial unlocked
+	conn, err := t.doDial(ctx)
 	if err != nil {
-		c.conn.Close()
-		c.conn = nil
+		return err
+	}
+	t.mu.Lock() // lock again for setting the worker
+	defer t.mu.Unlock()
+	if t.state == nil {
+		t.state = &dnsOverConnState{}
+	}
+	// Lock may cause a reschedule. So a goroutine that was racing with
+	// us for connecting may have overtake us and the writer could already
+	// have been set. In such a case, close the connection.
+	if t.worker == nil {
+		t.worker = &dnsOverConnWorker{
+			codec:    t.getCodec(),
+			conn:     conn,
+			state:    t.state,
+			streamer: t.streamer(),
+		}
+		go t.worker.reader() // all seems good, start reader
+	} else {
+		conn.Close()
+	}
+	return t.writeWithCurrentWorkerUnlocked(ctx, query, codec)
+}
+
+// writeWithCurrentWorkerUnlocked attempts to write with the
+// worker that we are currently using.
+func (t *DNSOverConnTransport) writeWithCurrentWorkerUnlocked(
+	ctx context.Context, query *DNSQuery, codec DNSCodec) error {
+	// The DNSTransport protocol says we should honour the
+	// context. Here we're waiting for a few milliseconds
+	// and this is not a big deal in terms of stalling OONI.
+	const writeTimeout = 10 * time.Millisecond
+	if t.worker == nil {
+		return errNoWorker
+	}
+	if err := t.worker.write(query.Raw, writeTimeout); err != nil {
+		t.worker.close()
+		t.worker = nil
+		return err
+	}
+	return nil
+}
+
+// doDial dials a new connection.
+func (t *DNSOverConnTransport) doDial(ctx context.Context) (net.Conn, error) {
+	network := t.Network
+	switch network {
+	case "tls":
+		network = "tcp" // adjust for connecting using TCP
+	}
+	// Again, DNSTransportProtocol: we MUST honour the context so
+	// we're doing an async dial in a background goroutine.
+	return t.doDialAsync(ctx, network, t.Address)
+}
+
+// doDialAsync dials in the background so that we do
+// not block for too much time if the context is cancelled.
+func (t *DNSOverConnTransport) doDialAsync(ctx context.Context,
+	network, address string) (net.Conn, error) {
+	connch, errch := make(chan net.Conn), make(chan error, 1)
+	go func() {
+		conn, err := t.Dial(ctx, network, address)
+		if err != nil {
+			errch <- err // buffered chan
+			return
+		}
+		select {
+		case connch <- conn:
+		default:
+			conn.Close() // the context has won
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case conn := <-connch:
+		return conn, nil
+	case err := <-errch:
 		return nil, err
 	}
-	return data, nil
 }
 
-// close closes the connection.
-func (c *dnsChannel) close() error {
-	defer c.mu.Unlock()
-	c.mu.Lock()
-	if c.conn == nil {
-		return nil
-	}
-	err := c.conn.Close()
-	c.conn = nil
-	return err
-}
-
-// DNSOverTLSDialer is the Dialer used by DNSOverTLSResolver.
-type DNSOverTLSDialer interface {
-	DialTLSContext(ctx context.Context, network, address string) (net.Conn, error)
-}
-
-// DNSOverTLSResolver is a resolver using DNSOverTLS. The
-// user of this struct MUST NOT change its fields after initialization
-// because that MAY lead to data races.
-//
-// This struct will serialize the queries sent using the
-// underlying connection such that only a single thread
-// at any given time will have acccess to the conn.
-//
-// When done, call Close to close the underlying conn.
-type DNSOverTLSResolver struct {
-	// Address is the address of the TLS server to use. It
-	// MUST be set by the user before using this struct. If not
-	// set, then this code will obviously fail.
-	Address string
-
-	// Codec is the optional DNSCodec to use. If not set, then
-	// we will use the default miekg/dns codec.
-	Codec DNSCodec
-
-	// Dialer is the optional Dialer to use. If not set, then
-	// we will use a default constructed Dialer struct. If
-	// you manually set this field, remember that you SHOULD
-	// configure the ALPN to be "dot".
-	Dialer DNSOverTLSDialer
-
-	// mu provides synchronization.
-	mu sync.Mutex
-
-	// reso is the resolver implementation.
-	reso *dnsGenericResolver
-}
-
-// LookupHost implements DNSUnderlyingResolver.LookupHost. This
-// function WILL NOT wrap the returned error. We assume that
-// this job is performed by DNSResolver, which should be used
-// as a wrapper type for this type.
-func (r *DNSOverTLSResolver) LookupHost(
-	ctx context.Context, hostname string) ([]string, error) {
-	r.mu.Lock()
-	if r.reso == nil {
-		r.reso = &dnsGenericResolver{
-			codec:   r.codec(),
-			padding: true,
-			t: &dnsChannel{
-				address:  r.Address,
-				dial:     r.dialer().DialTLSContext,
-				network:  "tcp",
-				streamer: &dnsStreamerTCPTLS{},
-			},
-		}
-	}
-	r.mu.Unlock()
-	return r.reso.LookupHost(ctx, hostname)
-}
-
-// codec returns the DNSCodec to use.
-func (r *DNSOverTLSResolver) codec() DNSCodec {
-	if r.Codec != nil {
-		return r.Codec
+// getCodec returns a suitable DNSCodec.
+func (t *DNSOverConnTransport) getCodec() DNSCodec {
+	if t.codec != nil {
+		return t.codec
 	}
 	return &dnsMiekgCodec{}
 }
 
-// dialer returns the Dialer to use.
-func (r *DNSOverTLSResolver) dialer() DNSOverTLSDialer {
-	if r.Dialer != nil {
-		return r.Dialer
+// streamer returns a suitable dnsStreamer
+func (r *DNSOverConnTransport) streamer() dnsStreamer {
+	switch r.Network {
+	case "udp":
+		return &dnsStreamerUDP{}
+	default:
+		return &dnsStreamerTCPTLS{}
 	}
-	return &Dialer{ALPN: []string{"dot"}}
-}
-
-// Close closes the underlying connection (if any).
-func (r *DNSOverTLSResolver) Close() error {
-	defer r.mu.Unlock()
-	r.mu.Lock()
-	if r.reso == nil {
-		return nil
-	}
-	if t, ok := r.reso.t.(*dnsChannel); ok {
-		return t.close()
-	}
-	return nil
-}
-
-// DNSOverTCPDialer is the Dialer used by DNSOverTCPResolver.
-type DNSOverTCPDialer interface {
-	DialContext(ctx context.Context, network, address string) (net.Conn, error)
-}
-
-// DNSOverTCPResolver is a resolver using DNSOverTCP. The
-// user of this struct MUST NOT change its fields after initialization
-// because that MAY lead to data races.
-//
-// This struct will serialize the queries sent using the
-// underlying connection such that only a single thread
-// at any given time will have acccess to the conn.
-//
-// When done, call Close to close the underlying conn.
-type DNSOverTCPResolver struct {
-	// Address is the address of the TCP server to use. It
-	// MUST be set by the user before using this struct. If not
-	// set, then this code will obviously fail.
-	Address string
-
-	// Codec is the optional DNSCodec to use. If not set, then
-	// we will use the default miekg/dns codec.
-	Codec DNSCodec
-
-	// Dialer is the optional Dialer to use. If not set, then
-	// we will use a default constructed Dialer struct.
-	Dialer DNSOverTCPDialer
-
-	// mu provides synchronization.
-	mu sync.Mutex
-
-	// reso is the resolver implementation.
-	reso *dnsGenericResolver
-}
-
-// LookupHost implements DNSUnderlyingResolver.LookupHost. This
-// function WILL NOT wrap the returned error. We assume that
-// this job is performed by DNSResolver, which should be used
-// as a wrapper type for this type.
-func (r *DNSOverTCPResolver) LookupHost(
-	ctx context.Context, hostname string) ([]string, error) {
-	r.mu.Lock()
-	if r.reso == nil {
-		r.reso = &dnsGenericResolver{
-			codec:   r.codec(),
-			padding: false,
-			t: &dnsChannel{
-				address:  r.Address,
-				dial:     r.dialer().DialContext,
-				network:  "tcp",
-				streamer: &dnsStreamerTCPTLS{},
-			},
-		}
-	}
-	r.mu.Unlock()
-	return r.reso.LookupHost(ctx, hostname)
-}
-
-// codec returns the DNSCodec to use.
-func (r *DNSOverTCPResolver) codec() DNSCodec {
-	if r.Codec != nil {
-		return r.Codec
-	}
-	return &dnsMiekgCodec{}
-}
-
-// dialer returns the Dialer to use.
-func (r *DNSOverTCPResolver) dialer() DNSOverTCPDialer {
-	if r.Dialer != nil {
-		return r.Dialer
-	}
-	return &Dialer{}
-}
-
-// Close closes the underlying connection.
-func (r *DNSOverTCPResolver) Close() error {
-	defer r.mu.Unlock()
-	r.mu.Lock()
-	if r.reso == nil {
-		return nil
-	}
-	if t, ok := r.reso.t.(*dnsChannel); ok {
-		return t.close()
-	}
-	return nil
-}
-
-// DNSOverUDPDialer is the Dialer used by DNSOverUDPResolver.
-type DNSOverUDPDialer interface {
-	DialContext(ctx context.Context, network, address string) (net.Conn, error)
-}
-
-// DNSOverUDPResolver is a resolver using DNSOverUDP. The
-// user of this struct MUST NOT change its fields after initialization
-// because that MAY lead to data races.
-//
-// This struct will serialize the queries sent using the
-// underlying connection such that only a single thread
-// at any given time will have acccess to the conn.
-//
-// When done, call Close to close the underlying conn.
-type DNSOverUDPResolver struct {
-	// Address is the address of the UDP server to use. It
-	// MUST be set by the user before using this struct. If not
-	// set, then this code will obviously fail.
-	Address string
-
-	// Codec is the optional DNSCodec to use. If not set, then
-	// we will use the default miekg/dns codec.
-	Codec DNSCodec
-
-	// Dialer is the optional Dialer to use. If not set, then
-	// we will use a default constructed Dialer struct.
-	Dialer DNSOverUDPDialer
-
-	// mu provides synchronization.
-	mu sync.Mutex
-
-	// reso is the resolver implementation.
-	reso *dnsGenericResolver
-}
-
-// LookupHost implements DNSUnderlyingResolver.LookupHost. This
-// function WILL NOT wrap the returned error. We assume that
-// this job is performed by DNSResolver, which should be used
-// as a wrapper type for this type.
-func (r *DNSOverUDPResolver) LookupHost(
-	ctx context.Context, hostname string) ([]string, error) {
-	r.mu.Lock()
-	if r.reso == nil {
-		r.reso = &dnsGenericResolver{
-			codec:   r.codec(),
-			padding: false,
-			t: &dnsChannel{
-				address:  r.Address,
-				dial:     r.dialer().DialContext,
-				network:  "udp",
-				streamer: &dnsStreamerUDP{},
-			},
-		}
-	}
-	r.mu.Unlock()
-	return r.reso.LookupHost(ctx, hostname)
-}
-
-// codec returns the DNSCodec to use.
-func (r *DNSOverUDPResolver) codec() DNSCodec {
-	if r.Codec != nil {
-		return r.Codec
-	}
-	return &dnsMiekgCodec{}
-}
-
-// dialer returns the Dialer to use.
-func (r *DNSOverUDPResolver) dialer() DNSOverUDPDialer {
-	if r.Dialer != nil {
-		return r.Dialer
-	}
-	return &Dialer{}
-}
-
-// Close closes the underlying connection.
-func (r *DNSOverUDPResolver) Close() error {
-	defer r.mu.Unlock()
-	r.mu.Lock()
-	if r.reso == nil {
-		return nil
-	}
-	if t, ok := r.reso.t.(*dnsChannel); ok {
-		return t.close()
-	}
-	return nil
 }
