@@ -22,7 +22,7 @@ func NewSystemTransport(config Config) RoundTripper {
 	// back the true headers, such as Content-Length. This change is
 	// functional to OONI's goal of observing the network.
 	txp.DisableCompression = true
-	return txp
+	return newRoundtripper(txp, config.TLSDialer, config.TLSConfig)
 }
 
 var _ RoundTripper = &http.Transport{}
